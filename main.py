@@ -9,7 +9,10 @@ import contextlib
 import hashlib
 import json
 import logging
+import os
+import signal
 import time
+from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -17,6 +20,9 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 from starlette.requests import ClientDisconnect
 
 import db
+import dispatcher
+import meta
+import tokens
 from config import IG_APP_SECRET, IG_VERIFY_TOKEN
 from signature import verify_signature, verify_token
 
@@ -31,7 +37,22 @@ MAX_BODY_BYTES = 256 * 1024
 MAX_EVENTS_PER_REQUEST = 200
 # event_key входит в btree-индекс (предел строки ~2704 байта) — длинный id заменяем хешем.
 MAX_EVENT_KEY_LEN = 200
+# Сколько секунд без круга диспетчера считаем смертью цикла. Круг идёт раз в 5 с даже
+# на простое, так что две минуты — это уже не «занят», а «не работает».
+HEALTH_STALE_SEC = 120
+# Окно дожатия на остановке. Худший случай доставки больше окна (два throttle плюс два
+# POST по 20 с = 46 с), и это осознанно: окно закрывает публичный ответ и начало директа,
+# а срезка на самом директе безопасна — второй private reply на тот же комментарий
+# запрещает уже платформа. Раздувать окно дороже: на всё время дожатия закрыт приём
+# вебхуков. Новую доставку внутри окна диспетчер не начинает (dispatcher.tick).
+# В compose под это стоит stop_grace_period: 30s — без него Docker убьёт контейнер
+# через 10 с и окно останется только на бумаге.
+SHUTDOWN_GRACE_SEC = 25
+# Как часто сторожок смотрит, жив ли круг диспетчера.
+WATCHDOG_SWEEP_SEC = 60
 RETENTION_SWEEP_SEC = 6 * 60 * 60
+# Продление токена: запас до истечения — 10 суток, поэтому раз в шесть часов с избытком.
+TOKEN_SWEEP_SEC = 6 * 60 * 60
 # Тело в 256 КБ приходит за миллисекунды. Пятнадцати секунд хватает любому честному
 # отправителю, а держать соединение открытым вечно ни uvicorn, ни Caddy не мешают.
 BODY_READ_TIMEOUT_SEC = 15
@@ -40,7 +61,9 @@ BODY_READ_TIMEOUT_SEC = 15
 REJECT_LOG_PERIOD_SEC = 60
 
 rejected_total = 0
-rejected_logged_at = 0.0
+# None, а не 0.0: monotonic считается от загрузки хоста, и на свежем хосте первая сводка
+# об отказах не попала бы в лог вовсе. Тот же капкан, что чинили в диспетчере.
+rejected_logged_at: float | None = None
 
 
 @asynccontextmanager
@@ -49,14 +72,69 @@ async def lifespan(app: FastAPI):
     await db.pool.open()
     applied = await db.migrate()
     log.info("миграции: %s", ", ".join(applied) if applied else "нечего применять")
-    retention = asyncio.create_task(retention_loop())
-    # Исключение таска нужно вычитать, иначе смерть цикла пройдёт молча.
-    retention.add_done_callback(lambda t: t.cancelled() or t.exception())
+    try:
+        await tokens.ensure_from_env()
+    except Exception:
+        # Приём вебхуков важнее отправки: без токена приёмник обязан работать дальше,
+        # а диспетчер сам встанет на паузу и скажет об этом владельцу.
+        log.exception("первичная загрузка токена")
+    loops = [
+        asyncio.create_task(retention_loop()),
+        asyncio.create_task(token_loop()),
+        asyncio.create_task(watchdog_loop()),
+        asyncio.create_task(dispatcher.run()),
+    ]
+    retention, token, guard, dispatch = loops
+    for name, task in (
+        ("ретеншен", retention),
+        ("токен", token),
+        ("сторожок", guard),
+        ("диспетчер", dispatch),
+    ):
+        task.add_done_callback(watch(name))
     yield
+    # Сначала даём диспетчеру дожать текущую доставку: отмена посреди публичного ответа
+    # оборачивается второй репликой под комментарием, когда свипер поднимет строку.
+    dispatcher.stopping.set()
     retention.cancel()
-    with contextlib.suppress(asyncio.CancelledError):
-        await retention  # дожидаемся, иначе pool.close() выдернет соединение из-под DELETE
+    token.cancel()
+    guard.cancel()
+    done, pending = await asyncio.wait([dispatch], timeout=SHUTDOWN_GRACE_SEC)
+    if pending:
+        log.warning("диспетчер не успел за %s с — отменяю", SHUTDOWN_GRACE_SEC)
+        dispatch.cancel()
+    for task in loops:
+        # Дожидаемся: иначе pool.close() выдернет соединение из-под работающего запроса.
+        # suppress(BaseException), а не CancelledError: уже умерший таск иначе пере-бросит
+        # своё исключение сюда, и ни meta.close(), ни pool.close() не выполнятся.
+        with contextlib.suppress(BaseException):
+            await task
+    await meta.close()
     await db.pool.close()
+
+
+def watch(name: str):
+    """Смерть фонового цикла обязана быть видна снаружи.
+
+    t.exception() без записи гасит и штатное предупреждение Python, и сам факт: контейнер
+    остаётся живым, health отвечает 200, а работа не делается. Поэтому — строка в лог и
+    SIGTERM себе: перезапуск делает restart: unless-stopped, а не наши руки.
+    """
+
+    def done(task: asyncio.Task) -> None:
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is None:
+            return
+        try:
+            log.error("цикл %s умер: %r — прошу перезапуск контейнера", name, exc)
+        finally:
+            # Сигнал важнее записи: если логирование по любой причине бросит, перезапуск
+            # всё равно обязан случиться, иначе контейнер останется живым и немым.
+            os.kill(os.getpid(), signal.SIGTERM)
+
+    return done
 
 
 app = FastAPI(lifespan=lifespan)
@@ -74,9 +152,59 @@ async def retention_loop():
         await asyncio.sleep(RETENTION_SWEEP_SEC)
 
 
+async def watchdog_loop():
+    """Сторожок за кругом диспетчера.
+
+    Смерть таска ловит watch(), а вот ЗАМЕРШИЙ, но живой круг не ловит никто: Docker Compose
+    на unhealthy не реагирует (перезапуск по healthcheck умеет Swarm), то есть 503 на
+    /ig/health — сигнал без адресата. Здесь у сигнала появляется актор: алерт владельцу и
+    тот же SIGTERM себе, что и при смерти цикла, — дальше работает restart: unless-stopped.
+    """
+    while True:
+        await asyncio.sleep(WATCHDOG_SWEEP_SEC)
+        last = dispatcher.last_tick_at
+        if last is None or dispatcher.stopping.is_set():
+            continue
+        stale = (datetime.now(timezone.utc) - last).total_seconds()
+        if stale <= HEALTH_STALE_SEC:
+            continue
+        log.error("круг диспетчера замер на %s с — прошу перезапуск контейнера", int(stale))
+        try:
+            await meta.alert_owner(
+                f"Instagram: круг диспетчера замер на {int(stale)} с, автоответы не идут.\n"
+                "Перезапускаю контейнер сам; если сообщение повторяется — смотрите логи."
+            )
+        finally:
+            os.kill(os.getpid(), signal.SIGTERM)
+        return
+
+
+async def token_loop():
+    """Продление токена заранее: непродлённый 60 дней умирает навсегда."""
+    while True:
+        try:
+            await tokens.refresh_if_needed()
+        except Exception:
+            log.exception("token refresh")
+        await asyncio.sleep(TOKEN_SWEEP_SEC)
+
+
 @app.get("/ig/health")
 async def health():
-    return {"ok": True}
+    """Живость = свежесть круга диспетчера, а не факт ответа HTTP.
+
+    Безусловные 200 и были той причиной, по которой немой сервис выглядел здоровым:
+    контейнер жив, healthcheck зелёный, а отвечать людям некому. В БД не ходим намеренно —
+    приёмник вебхуков обязан отвечать Meta и при мигнувшем Postgres.
+    """
+    last = dispatcher.last_tick_at
+    stale = (datetime.now(timezone.utc) - last).total_seconds() if last else None
+    body = {"ok": True, "last_tick_at": last.isoformat() if last else None}
+    if stale is not None and stale > HEALTH_STALE_SEC:
+        body["ok"] = False
+        body["stale_sec"] = int(stale)
+        return JSONResponse(body, status_code=503)
+    return body
 
 
 @app.get("/ig/webhook")
@@ -180,7 +308,7 @@ def note_rejected(reason: str) -> None:
     global rejected_total, rejected_logged_at
     rejected_total += 1
     now = time.monotonic()
-    if now - rejected_logged_at >= REJECT_LOG_PERIOD_SEC:
+    if rejected_logged_at is None or now - rejected_logged_at >= REJECT_LOG_PERIOD_SEC:
         rejected_logged_at = now
         log.warning("отказ (%s); отказов с рестарта: %s", reason, rejected_total)
 
