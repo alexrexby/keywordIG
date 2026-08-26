@@ -435,3 +435,143 @@ async def mark_token_invalid(reason: str) -> None:
             " WHERE id = 1",
             (reason,),
         )
+
+
+# ---------- Этап 5: админ-API правил ----------
+# CRUD для формы в CRM. Читает и пишет ТОЛЬКО instagram.ig_rule: правило — это
+# единственное, что человек заводит руками. Доставки, события и токен админка не трогает.
+
+
+class RuleRejected(Exception):
+    """Ограничение таблицы не пустило правило. Наружу уходит человеческим текстом,
+    а не CheckViolation: форма не должна показывать владельцу сырую ошибку Postgres."""
+
+
+# Правило целиком, как его видит форма: то же, что читает диспетчер, плюс enabled,
+# create_lead_on и метки времени — редактору нужна вся строка, а не только поля доставки.
+ADMIN_RULE_COLUMNS = (
+    'id, name, enabled, "trigger", media_id, keywords, match_mode, priority,'
+    " public_replies, duplicate_replies, dm_text, dm_buttons, create_lead_on,"
+    " created_at, updated_at"
+)
+# Порядок записи. Ровно эти двенадцать полей админка и меняет; id и метки времени
+# ставит база. Список один на INSERT и UPDATE, чтобы они не разъехались.
+ADMIN_RULE_FIELDS = (
+    "name",
+    "enabled",
+    "trigger",
+    "media_id",
+    "keywords",
+    "match_mode",
+    "priority",
+    "public_replies",
+    "duplicate_replies",
+    "dm_text",
+    "dm_buttons",
+    "create_lead_on",
+)
+
+
+def _rule_params(values: dict) -> tuple:
+    """Значения в порядке ADMIN_RULE_FIELDS. jsonb-поле оборачивается явно."""
+    return tuple(
+        Jsonb(values[name]) if name == "dm_buttons" else values[name]
+        for name in ADMIN_RULE_FIELDS
+    )
+
+
+# Что именно ловим при записи правила. Не psycopg.Error целиком: тогда отказ соединения
+# превратился бы в «правило не приняла база», а это разные новости для того, кто читает.
+#   IntegrityError — нарушены ограничения (CHECK, уникальность);
+#   DataError      — значение не лезет в колонку (int4 вне диапазона, нулевой байт).
+WRITE_ERRORS = (psycopg.errors.IntegrityError, psycopg.DataError)
+
+
+def _rule_rejected(exc: psycopg.Error) -> RuleRejected:
+    constraint = getattr(exc.diag, "constraint_name", "") or ""
+    if exc.sqlstate == "22003":
+        return RuleRejected("число не помещается в колонку: priority — 32-битное целое")
+    if constraint == "ig_rule_dm_text_len":
+        return RuleRejected(
+            "текст DM длиннее 4096 байт в самом шаблоне — дальше его не разбирает и"
+            " движок текстов (rules.MAX_TEMPLATE_BYTES). Лимит платформы тут ни при чём:"
+            " он считается по худшему раскрытию и проверяется до записи."
+        )
+    return RuleRejected(f"правило не приняла база (ограничение {constraint or exc.sqlstate})")
+
+
+async def admin_list_rules() -> list[dict]:
+    """Все правила, включая выключенные: форма показывает и черновики."""
+    async with pool_ref().connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                f"SELECT {ADMIN_RULE_COLUMNS} FROM instagram.ig_rule"
+                " ORDER BY priority DESC, id"
+            )
+            return await cur.fetchall()
+
+
+async def admin_get_rule(rule_id: int) -> dict | None:
+    """Правило по id БЕЗ фильтра enabled — в отличие от load_rule, который читает
+    диспетчер: тому выключенное правило не нужно, а редактору нужно именно оно."""
+    async with pool_ref().connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                f"SELECT {ADMIN_RULE_COLUMNS} FROM instagram.ig_rule WHERE id = %s",
+                (rule_id,),
+            )
+            return await cur.fetchone()
+
+
+async def admin_insert_rule(values: dict) -> dict:
+    async with pool_ref().connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            try:
+                await cur.execute(
+                    "INSERT INTO instagram.ig_rule"
+                    ' (name, enabled, "trigger", media_id, keywords, match_mode, priority,'
+                    "  public_replies, duplicate_replies, dm_text, dm_buttons, create_lead_on)"
+                    " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
+                    f" RETURNING {ADMIN_RULE_COLUMNS}",
+                    _rule_params(values),
+                )
+            except WRITE_ERRORS as exc:
+                raise _rule_rejected(exc) from exc
+            return await cur.fetchone()
+
+
+async def admin_update_rule(rule_id: int, values: dict) -> dict | None:
+    """Пишет все двенадцать полей разом: частичные правки сводит воедино админка,
+    а сюда приходит уже целое правило. Динамического SQL поэтому нет вовсе."""
+    async with pool_ref().connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            try:
+                await cur.execute(
+                    "UPDATE instagram.ig_rule SET"
+                    '   name = %s, enabled = %s, "trigger" = %s, media_id = %s,'
+                    "   keywords = %s, match_mode = %s, priority = %s,"
+                    "   public_replies = %s, duplicate_replies = %s, dm_text = %s,"
+                    "   dm_buttons = %s, create_lead_on = %s, updated_at = now()"
+                    f" WHERE id = %s RETURNING {ADMIN_RULE_COLUMNS}",
+                    _rule_params(values) + (rule_id,),
+                )
+            except WRITE_ERRORS as exc:
+                raise _rule_rejected(exc) from exc
+            return await cur.fetchone()
+
+
+async def admin_delete_rule(rule_id: int) -> bool:
+    """Удаление правила уносит с собой резервации (ON DELETE CASCADE в 002) — то есть
+    снимает запрет «этому человеку уже выдавали». Сколько именно, админка считает ДО
+    удаления и говорит вслух: восстановить их нечем."""
+    async with pool_ref().connection() as conn:
+        cur = await conn.execute("DELETE FROM instagram.ig_rule WHERE id = %s", (rule_id,))
+        return cur.rowcount > 0
+
+
+async def admin_count_contacts(rule_id: int) -> int:
+    async with pool_ref().connection() as conn:
+        cur = await conn.execute(
+            "SELECT count(*) FROM instagram.ig_contact_rule WHERE rule_id = %s", (rule_id,)
+        )
+        return (await cur.fetchone())[0]

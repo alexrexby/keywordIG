@@ -19,6 +19,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 from starlette.requests import ClientDisconnect
 
+import admin
 import db
 import dispatcher
 import logsafe
@@ -142,6 +143,10 @@ def watch(name: str):
 
 
 app = FastAPI(lifespan=lifespan)
+# Админ-API правил (web → сервис) — отдельным модулем со своими воротами IG_ADMIN_TOKEN.
+# Приёма вебхуков он не касается: убрать эту строку и admin.py достаточно, чтобы сервис
+# вернулся к состоянию этапа 2.
+app.include_router(admin.router)
 
 
 async def retention_loop():

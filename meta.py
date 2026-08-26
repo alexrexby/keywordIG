@@ -185,6 +185,22 @@ def _fit(text: str) -> str:
 # ---------- Токен ----------
 
 
+async def fetch_me(token: str) -> dict:
+    """Кто стоит за токеном. Дешёвый зонд: тело — единицы байт, прав не требует.
+
+    Просим сразу три поля, а не одно: у флоу Instagram Login `id` отдаёт app-scoped
+    идентификатор, а `user_id` — тот, что виден в вебхуке, и какое из них вернётся под
+    текущей версией Graph, источником с датой я не подтверждал. Сверять будем по любому
+    совпадению — иначе зонд начнёт кричать «токен от другого аккаунта» на исправном токене.
+    """
+    url = f"{GRAPH_HOST}/{IG_GRAPH_VERSION}/me"
+    try:
+        resp = await client().get(url, params={"fields": "id,user_id,username", "access_token": token})
+    except httpx.HTTPError as exc:
+        raise _transport(exc, url) from exc
+    return _unwrap(resp, url)
+
+
 async def refresh_token(token: str) -> tuple[str, int]:
     """Продление long-lived токена. Возвращает (новый токен, секунд жизни).
 
