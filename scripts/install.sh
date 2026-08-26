@@ -159,13 +159,18 @@ machine_ips() {
 }
 
 port_listener() {
-	# 0 — порт кто-то слушает. Нечем проверить — считаем, что свободен, и говорим об этом.
+	# 0 — порт кто-то слушает, 1 — свободен, 2 — проверить нечем.
+	#
+	# Приговор выносится по ВЫВОДУ, а не по коду возврата, и lsof здесь не используется
+	# вовсе: в busybox это заглушка, которая на любые аргументы печатает все открытые
+	# файлы и возвращает ноль. С ней проверка отвечала «порт занят» всегда — то есть
+	# отказывала в установке на пустой машине, ровно там, где обязана пропускать.
 	if command -v ss >/dev/null 2>&1; then
 		ss -Hltn "sport = :$1" 2>/dev/null | grep -q .
-	elif command -v lsof >/dev/null 2>&1; then
-		lsof -iTCP:"$1" -sTCP:LISTEN -n -P >/dev/null 2>&1
+	elif command -v netstat >/dev/null 2>&1; then
+		netstat -ltn 2>/dev/null | grep -qE "[:.]$1[[:space:]]"
 	else
-		return 1
+		return 2
 	fi
 }
 
@@ -214,9 +219,14 @@ preflight() {
 		fi
 	fi
 
-	local port
+	local port taken
 	for port in 80 443; do
-		if port_listener "$port"; then
+		taken=0
+		port_listener "$port" || taken=$?
+		if [ "$taken" = "2" ]; then
+			say "занятость порта $port проверить нечем (нет ни ss, ни netstat) — если он занят,"
+			say "   прокси не поднимется, и это будет видно на шаге 4, а не молча"
+		elif [ "$taken" = "0" ]; then
 			if our_caddy_running; then
 				say "порт $port занят прокси этой же установки — это повторный запуск, продолжаю"
 			else
