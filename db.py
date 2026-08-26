@@ -388,6 +388,23 @@ async def count_pending() -> int:
         return (await cur.fetchone())[0]
 
 
+async def count_states_since(hours: int) -> dict[str, int]:
+    """Доставки за окно, разложенные по состояниям. Сумма здесь не нужна — нужна ДОЛЯ.
+
+    «Событий 40, все до одного адресованы чужому аккаунту» — это диагноз, а «событий 40»
+    и «чужих 40» по отдельности — две строки статистики, из которых человек вывод не
+    сделает. Считаем по created_at: интересует, что пришло, а не когда доставку доправили.
+    """
+    async with pool_ref().connection() as conn:
+        cur = await conn.execute(
+            "SELECT state, count(*) FROM instagram.ig_delivery"
+            " WHERE created_at > now() - make_interval(hours => %s)"
+            " GROUP BY state",
+            (hours,),
+        )
+        return {row[0]: row[1] for row in await cur.fetchall()}
+
+
 async def count_dm_sent_since(hours: int) -> int:
     """Сколько сообщений реально ушло за окно. Это бюджет аккаунта, а не темп сервера."""
     async with pool_ref().connection() as conn:

@@ -32,7 +32,7 @@ import dispatcher
 import meta
 import rules
 import tokens
-from config import IG_ADMIN_TOKEN, IG_DAILY_DM_LIMIT
+from config import IG_ADMIN_TOKEN, IG_DAILY_DM_LIMIT, IG_USER_ID
 from meta import MAX_BUTTONS, MAX_BUTTON_TITLE
 from signature import constant_time_eq
 
@@ -361,6 +361,9 @@ async def state():
     token = await tokens.state()
     pending = await db.count_pending()
     sent_24h = await db.count_dm_sent_since(24)
+    states_24h = await db.count_states_since(24)
+    handled_24h = sum(states_24h.values())
+    foreign_24h = states_24h.get("SKIPPED_FOREIGN_ACCOUNT", 0)
     last_tick = dispatcher.last_tick_at
     stale = (datetime.now(timezone.utc) - last_tick).total_seconds() if last_tick else None
     limit_reached = IG_DAILY_DM_LIMIT > 0 and sent_24h >= IG_DAILY_DM_LIMIT
@@ -380,6 +383,18 @@ async def state():
             "stopping": dispatcher.stopping.is_set(),
         },
         "daily": {"limit": IG_DAILY_DM_LIMIT, "sent_24h": sent_24h, "reached": limit_reached},
+        # ВЕРДИКТ, а не строка статистики. «События есть, и НИ ОДНО не наше» — это
+        # диагноз «в IG_USER_ID не тот идентификатор»: у аккаунта их два, перепутать
+        # проще всего, а отказ при этом молчалив полностью (вебхуки идут, ошибок нет,
+        # очередь пуста). Отсюда его берёт doctor.sh — снаружи это не наблюдается никак.
+        # Ноль событий вердиктом НЕ является: это «ещё не приходило», отдельный случай.
+        "account": {
+            "ig_user_id": IG_USER_ID or None,
+            "handled_24h": handled_24h,
+            "foreign_24h": foreign_24h,
+            "wrong_ig_user_id": handled_24h > 0 and foreign_24h == handled_24h,
+            "last_foreign_entry_id": dispatcher.last_foreign_entry_id,
+        },
         # last_ok_at = null при configured = true означает «канал ни разу не проверен»,
         # а не «аварий не было»: это отдельный вердикт, и закрывает его тестовое
         # сообщение (meta.send_test_alert), которое подтверждает ЧЕЛОВЕК.
