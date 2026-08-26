@@ -21,12 +21,16 @@ from starlette.requests import ClientDisconnect
 
 import db
 import dispatcher
+import logsafe
 import meta
 import tokens
 from config import IG_APP_SECRET, IG_VERIFY_TOKEN
 from signature import verify_signature, verify_token
 
 logging.basicConfig(level=logging.INFO)
+# После basicConfig: фильтр вешается на УЖЕ созданный обработчик. Затирает секреты у всех
+# логгеров процесса, включая сторонние, — точечные уровни обойдёт первая же новая библиотека.
+logsafe.install()
 log = logging.getLogger("main")
 
 # Тело Meta — единицы килобайт. Тот же предел стоит рубежом раньше, в Caddy

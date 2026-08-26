@@ -16,6 +16,7 @@ from typing import Any
 
 import httpx
 
+import logsafe
 from rules import MAX_MESSAGE_BYTES, clip
 from config import (
     IG_ALERT_TG_USER_ID,
@@ -25,6 +26,10 @@ from config import (
 )
 
 log = logging.getLogger("meta")
+# На импорте, а не только из main: продление токена кладёт секрет в АДРЕС запроса, а httpx
+# печатает адрес на INFO. Кто бы ни импортировал этот модуль — тест, воркер, будущий скрипт —
+# болтливые библиотеки уже приглушены. Фильтр на обработчики main вешает после basicConfig.
+logsafe.install()
 
 GRAPH_HOST = "https://graph.instagram.com"
 HTTP_TIMEOUT_SEC = 20
