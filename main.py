@@ -87,6 +87,9 @@ async def lifespan(app: FastAPI):
             "канал алертов не настроен (пусты IG_ALERT_BOT_TOKEN или IG_ALERT_CHAT_ID) — "
             "сказать об остановке автоответов будет некому и нечем"
         )
+    # Что панель помнит между запусками (отзыв сессий): без этого «Выйти» отменялся бы
+    # первым же деплоем. Отказ чтения старт не отменяет — приём вебхуков важнее.
+    await panel.restore()
     try:
         await tokens.ensure_from_env()
     except Exception:

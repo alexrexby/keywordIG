@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% block title %}Данные человека{% endblock %}
+{% block body %}
+<h1>Данные человека</h1>
+<p class="hint">
+  Сюда приходят по письму «удалите мои данные» — адрес для таких писем напечатан
+  на странице <a href="/data-deletion">«Удаление данных»</a>. Найдите человека по имени
+  пользователя в Instagram или по его идентификатору и удалите всё, что о нём есть.
+</p>
+<form method="get" action="/panel/person">
+  <label for="q">Имя пользователя или идентификатор</label>
+  <input type="text" id="q" name="q" value="{{ query }}" placeholder="ann_ivanova или 17841400000000000">
+  <div class="buttons"><button class="main" type="submit">Найти</button></div>
+</form>
+
+{% if searched and not people %}
+<p>Никого не нашли. Имя ищется по части и без учёта регистра, идентификатор — целиком.</p>
+{% endif %}
+
+{% for person in people %}
+<div class="item">
+  <p>
+    {% if person.username %}<b>@{{ person.username }}</b> · {% endif %}{{ person.igsid }}
+  </p>
+  <p class="meta">
+    Обращений: {{ person.deliveries }}{% if person.last_at %}, последнее {{ person.last_at }}{% endif %} ·
+    отметок «материал уже выдавали»: {{ person.holds }}
+  </p>
+  <p class="hint">
+    Удалим карточки обращений (текст, имя пользователя, наши ответы) и отметки о выдаче.
+    После этого сервис перестанет его узнавать: обратится снова — получит материал ещё раз.
+    Это следствие удаления, а не ошибка: помнить, что материал уже уходил, значит хранить
+    его идентификатор — ровно то, о чём он попросил забыть.
+  </p>
+  <form method="post" action="/panel/person/forget">
+    <input type="hidden" name="_csrf" value="{{ csrf }}">
+    <input type="hidden" name="igsid" value="{{ person.igsid }}">
+    <button class="risky" type="submit">Удалить всё об этом человеке</button>
+  </form>
+</div>
+{% endfor %}
+{% endblock %}

@@ -563,33 +563,49 @@ async def mark_token_invalid(reason: str) -> None:
         )
 
 
-# ---------- Канал аварийных сообщений ----------
-# Состояние канала пережидает рестарт в базе, а не в памяти процесса: панель строит
-# на нём вердикт, и после каждого деплоя «канал не проверен ни разу» вытесняло бы
-# настоящие диагнозы. Миграция 006, там же почему таблица, а не две переменные.
+# ---------- Состояние установки ----------
+# Всё, что живёт в памяти процесса, но обязано пережить рестарт: канал аварийных сообщений
+# и отзыв сессий панели. Миграция 006, там же почему таблица и что в неё класть можно.
 
 
-async def load_alert_state() -> dict | None:
-    """Когда сигнал доходил в последний раз и чем ответил мессенджер. None — строки нет."""
+async def load_state() -> dict | None:
+    """Строка состояния целиком. None — строки нет (база старше миграции 006)."""
     async with pool_ref().connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
-                "SELECT last_ok_at, last_error FROM instagram.ig_alert_channel WHERE id = 1"
+                "SELECT alert_ok_at, alert_error, sessions_valid_after"
+                "  FROM instagram.ig_state WHERE id = 1"
             )
             return await cur.fetchone()
 
 
 async def save_alert_state(last_ok_at, last_error: str | None) -> None:
     """Исход попытки доставки сигнала. Пишется ПОСЛЕ ответа мессенджера, вне транзакций
-    отправки: запись в базу не должна ни задерживать сигнал, ни отменять его."""
+    отправки: запись в базу не должна ни задерживать сигнал, ни отменять его.
+
+    coalesce на alert_ok_at — чтобы неудачная попытка не стирала время последней удачной:
+    «когда сигнал доходил в последний раз» и «чем кончилась последняя попытка» — разные
+    факты, и путать их значит терять единственный признак живого канала.
+    """
     async with pool_ref().connection() as conn:
         await conn.execute(
-            "INSERT INTO instagram.ig_alert_channel (id, last_ok_at, last_error)"
+            "INSERT INTO instagram.ig_state (id, alert_ok_at, alert_error)"
             " VALUES (1, %s, %s)"
-            " ON CONFLICT (id) DO UPDATE SET last_ok_at = coalesce(EXCLUDED.last_ok_at,"
-            "   instagram.ig_alert_channel.last_ok_at),"
-            "   last_error = EXCLUDED.last_error, updated_at = now()",
+            " ON CONFLICT (id) DO UPDATE SET alert_ok_at = coalesce(EXCLUDED.alert_ok_at,"
+            "   instagram.ig_state.alert_ok_at),"
+            "   alert_error = EXCLUDED.alert_error, updated_at = now()",
             (last_ok_at, last_error),
+        )
+
+
+async def revoke_sessions(moment) -> None:
+    """Все сессии панели, выданные раньше этого момента, недействительны."""
+    async with pool_ref().connection() as conn:
+        await conn.execute(
+            "INSERT INTO instagram.ig_state (id, sessions_valid_after) VALUES (1, %s)"
+            " ON CONFLICT (id) DO UPDATE SET sessions_valid_after = EXCLUDED.sessions_valid_after,"
+            "   updated_at = now()",
+            (moment,),
         )
 
 
@@ -867,6 +883,72 @@ async def admin_orphan_holds(limit: int) -> list[dict]:
                 (limit,),
             )
             return await cur.fetchall()
+
+
+# ---------- Данные человека ----------
+# Ради обещания на публичной странице «Удаление данных»: «найдём и удалим всё, что связано
+# с вашим аккаунтом». Без этих двух запросов исполнить его можно было только руками в psql —
+# то есть ровно там, откуда SQL из аварийных сообщений и уводили. Обещание, которое
+# установщик не может выполнить органами управления пакета, — это враньё в публичном
+# документе, а не неудобство.
+
+
+async def admin_find_person(query: str, limit: int) -> list[dict]:
+    """Кто найден по идентификатору или имени пользователя. Строка на человека.
+
+    Ищем по ДВУМ таблицам: имя пользователя живёт только в карточках обращений, а
+    отметка «материал уже выдавали» переживает их чистку — человек, чьи карточки
+    вычищены по сроку, иначе не нашёлся бы вовсе, хотя данные о нём есть.
+    Имя сравнивается без учёта регистра и по подстроке (люди пишут «@ann», «Ann»),
+    идентификатор — точно: он числовой и подстрока в нём ничего не значит.
+    """
+    # % и _ в запросе человека — это подстановочные знаки LIKE: без экранирования
+    # поиск по «%» вернул бы всех и стал бы кнопкой «удалить чужие данные».
+    escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    async with pool_ref().connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                "WITH found AS ("
+                "  SELECT igsid FROM instagram.ig_delivery"
+                "   WHERE igsid = %(exact)s OR username ILIKE %(like)s ESCAPE '\\'"
+                "  UNION"
+                "  SELECT igsid FROM instagram.ig_contact_rule WHERE igsid = %(exact)s"
+                ")"
+                " SELECT f.igsid,"
+                "        (SELECT max(d.username) FROM instagram.ig_delivery d"
+                "          WHERE d.igsid = f.igsid) AS username,"
+                "        (SELECT count(*) FROM instagram.ig_delivery d"
+                "          WHERE d.igsid = f.igsid) AS deliveries,"
+                "        (SELECT max(d.created_at) FROM instagram.ig_delivery d"
+                "          WHERE d.igsid = f.igsid) AS last_at,"
+                "        (SELECT count(*) FROM instagram.ig_contact_rule c"
+                "          WHERE c.igsid = f.igsid) AS holds"
+                "   FROM found f ORDER BY last_at DESC NULLS LAST LIMIT %(limit)s",
+                {"exact": query, "like": f"%{escaped}%", "limit": limit},
+            )
+            return await cur.fetchall()
+
+
+async def admin_forget_person(igsid: str) -> tuple[int, int]:
+    """Удаляет всё об одном человеке: карточки обращений и отметки о выдаче материала.
+
+    Возвращает (сколько обращений, сколько отметок). Одной транзакцией: половина
+    удаления — это ответ «удалили» и оставшийся текст комментария в базе.
+
+    Снятая отметка означает, что по тем же правилам человек сможет получить материал
+    ещё раз, если обратится снова. Это следствие удаления, а не ошибка: помнить о нём
+    «чтобы не отправить дважды» — значит хранить его идентификатор, о чём он и просил.
+    """
+    async with pool_ref().connection() as conn:
+        async with conn.transaction():
+            cur = await conn.execute(
+                "DELETE FROM instagram.ig_delivery WHERE igsid = %s", (igsid,)
+            )
+            deliveries = cur.rowcount
+            cur = await conn.execute(
+                "DELETE FROM instagram.ig_contact_rule WHERE igsid = %s", (igsid,)
+            )
+            return deliveries, cur.rowcount
 
 
 async def admin_release_contact(delivery_id: int) -> int:

@@ -259,7 +259,9 @@ async def channel_state() -> dict:
     """
     stored = None
     try:
-        stored = await db.load_alert_state()
+        row = await db.load_state()
+        if row is not None:
+            stored = {"last_ok_at": row["alert_ok_at"], "last_error": row["alert_error"]}
     except Exception:
         log.warning("состояние канала алертов не прочиталось из базы, отвечаю по памяти")
     if stored is None:

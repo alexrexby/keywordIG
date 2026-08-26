@@ -119,9 +119,11 @@ _bad_session_total = 0
 _bad_session_logged_at: float | None = None
 REJECT_LOG_PERIOD_SEC = 60
 # Сессии, выданные раньше этого момента, недействительны. Кнопка «Выйти» иначе гасит
-# cookie только в ЭТОМ браузере, а подписанный токен живёт своей жизнью ещё 12 часов —
-# при том, что панель открывают в том числе с чужого телефона. Переменная процесса:
-# после рестарта отзыв теряется, и это честно сказано в отчёте, а не спрятано.
+# cookie только в ЭТОМ браузере, а подписанная cookie живёт своей жизнью ещё 12 часов —
+# при том, что панель открывают в том числе с чужого телефона.
+# Переменная — КЭШ: источник правды с миграции 006 лежит в instagram.ig_state, иначе
+# рестарт воскрешал бы отозванные сессии, а «Выйти», который не выходит, обманчивее
+# отсутствующей кнопки. Восстанавливается на старте (restore), пишется при выходе.
 _valid_after: float = 0.0
 
 # Параметры scrypt. n=2**14 при r=8 требует 16 МБ на проверку — это заметно для перебора
@@ -132,6 +134,9 @@ SCRYPT_MAXMEM = 64 * 1024 * 1024
 # до которого достаёт интернет.
 SCRYPT_MAX_N = 2**20
 
+# Сколько человек показывает поиск. Больше одного экрана не нужно: запрос на удаление
+# приходит письмом про одного конкретного человека.
+PERSON_RESULTS = 20
 # Сколько раскрытий показывает предпросмотр. Столько же, сколько отдаёт машинный
 # /ig/admin/preview: разное число примеров в двух местах читается как разное поведение.
 PREVIEW_SAMPLES = admin.PREVIEW_SAMPLES
@@ -165,6 +170,11 @@ NOTES = {
         " сама по себе снятая бронь отправку не запускает."
     ),
     "no-hold": "Брони на этой доставке уже нет — снимать нечего.",
+    "forgotten": (
+        "Удалили всё, что было об этом человеке. Если он обратится снова, сервис"
+        " ответит ему как новому — в том числе выдаст материал ещё раз: помнить,"
+        " что материал уже уходил, значит хранить его идентификатор."
+    ),
 }
 
 
@@ -264,6 +274,23 @@ def _read_session(raw: str | None) -> str | None:
     if int(issued) < _valid_after:
         return None  # сессии, отозванные кнопкой «Выйти»
     return sid
+
+
+async def restore() -> None:
+    """Поднять из базы то, что панель помнит между запусками. Зовётся из lifespan.
+
+    Пока это только отзыв сессий. Отказ чтения не роняет старт: без отметки панель
+    работает как раньше, а приём вебхуков от неё не зависит вовсе.
+    """
+    global _valid_after
+    try:
+        row = await db.load_state()
+    except Exception:
+        log.warning("состояние панели не прочиталось — отзыв сессий начнётся с нуля")
+        return
+    if row and row["sessions_valid_after"]:
+        _valid_after = row["sessions_valid_after"].timestamp()
+        log.info("панель: сессии, выданные до %s, недействительны", row["sessions_valid_after"])
 
 
 def _note_bad_session() -> None:
@@ -449,11 +476,21 @@ async def login(request: Request):
 
 @router.post("/logout")
 async def logout(form: dict = Depends(require_form)):
-    """Выход гасит и cookie, и саму подпись: cookie убирается у этого браузера, а
-    выданные до сих пор сессии перестают приниматься. Панель открывают с чужого телефона
-    в момент аварии — кнопка «Выйти» обязана делать то, что обещает."""
+    """Выход гасит и cookie, и саму подпись: cookie убирается у этого браузера, а все
+    выданные до сих пор сессии перестают приниматься — и после рестарта тоже.
+
+    Панель открывают с чужого телефона в момент аварии; кнопка «Выйти», после которой
+    старая cookie оживает первым же деплоем, обманчивее отсутствующей.
+    """
     global _valid_after
-    _valid_after = time.time()
+    moment = datetime.now(timezone.utc)
+    _valid_after = moment.timestamp()
+    try:
+        await db.revoke_sessions(moment)
+    except Exception:
+        # Отзыв в памяти уже случился: этот процесс старую cookie не примет. Молчать
+        # нельзя — после рестарта она оживёт, и человек об этом знать не будет.
+        log.error("отзыв сессий не записался в базу — после рестарта он потеряется")
     response = RedirectResponse(LOGIN_PATH, status_code=303)
     response.delete_cookie(COOKIE_NAME, path="/panel")
     return response
@@ -1175,6 +1212,53 @@ STATE_LABELS = {
     "REPLIED_DUPLICATE": "повтор, ответили под постом",
     "SKIPPED_FOREIGN_ACCOUNT": "чужой аккаунт",
 }
+
+
+# ---------- Данные человека ----------
+
+
+@router.get("/person", response_class=HTMLResponse)
+async def person_page(sid: str = Depends(require_session), q: str = "", note: str = ""):
+    """Поиск по человеку и удаление всего, что о нём есть.
+
+    Заведено не для полноты картины: публичная страница /data-deletion обещает «найдём
+    и удалим всё, что связано с вашим аккаунтом», а исполнить это можно было только
+    запросом в базу руками. Обещание, которое установщик не может выполнить органами
+    самого пакета, — это враньё в публичном документе.
+    """
+    query = q.strip()
+    return _render(
+        "person.html",
+        sid=sid,
+        note=NOTES.get(note, ""),
+        active="person",
+        query=query,
+        searched=bool(query),
+        people=[
+            {
+                "igsid": row["igsid"],
+                "username": row["username"],
+                "deliveries": row["deliveries"],
+                "holds": row["holds"],
+                "last_at": _when(_moment(row["last_at"])) if row["last_at"] else "",
+            }
+            for row in (await db.admin_find_person(query, PERSON_RESULTS) if query else [])
+        ],
+    )
+
+
+@router.post("/person/forget")
+async def person_forget(
+    sid: str = Depends(require_session), form: dict = Depends(require_form)
+):
+    igsid = str(form.get("igsid") or "").strip()
+    if not igsid:
+        return _back("/panel/person")
+    deliveries, holds = await db.admin_forget_person(igsid)
+    # В лог — только числа и идентификатор: имя пользователя и текст обращения человек
+    # попросил удалить, и оседать в логах установки они не должны.
+    log.info("удалены данные человека %s: обращений %s, отметок %s", igsid, deliveries, holds)
+    return _back("/panel/person", note="forgotten")
 
 
 # ---------- Токен ----------
