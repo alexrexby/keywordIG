@@ -327,25 +327,58 @@ async def release_contact_rule(rule_id: int, igsid: str, delivery_id: int) -> in
         return cur.rowcount
 
 
-async def mark_public_reply(delivery_id: int, reply_id: str) -> None:
+async def delivery_alive(delivery_id: int) -> bool:
+    """Существует ли ещё карточка обращения.
+
+    Диспетчер получает от claim_delivery СНИМОК строки и дальше к базе за подтверждением
+    не возвращается — а между снимком и обращением к Meta проходит от шести секунд до
+    сорока шести (throttle + таймаут запроса). Ровно в это окно попадает удаление данных
+    по просьбе человека: карточки уже нет, а публичный ответ под его комментарием и
+    материал в директ ещё уйдут. Спрашивать заново — единственный способ этого не сделать.
+    """
     async with pool_ref().connection() as conn:
-        await conn.execute(
+        cur = await conn.execute(
+            "SELECT 1 FROM instagram.ig_delivery WHERE id = %s", (delivery_id,)
+        )
+        return await cur.fetchone() is not None
+
+
+async def mark_public_reply(delivery_id: int, reply_id: str) -> int:
+    """Возвращает число затронутых строк. Ноль означает, что карточку удалили, пока мы
+    ходили в Meta: ответ УЖЕ ушёл, и молчать об этом нельзя — иначе отправка человеку,
+    попросившему себя удалить, не оставляет следа вообще нигде."""
+    async with pool_ref().connection() as conn:
+        cur = await conn.execute(
             "UPDATE instagram.ig_delivery"
             "   SET state = 'REPLIED_PUBLIC', public_reply_id = %s, updated_at = now()"
             " WHERE id = %s",
             (reply_id, delivery_id),
         )
+        if not cur.rowcount:
+            log.warning(
+                "доставка %s: публичный ответ ушёл, а карточки уже нет — её удалили,"
+                " пока запрос был в пути",
+                delivery_id,
+            )
+        return cur.rowcount
 
 
-async def note_dm_attempt(delivery_id: int) -> None:
+async def note_dm_attempt(delivery_id: int) -> int:
     """Отметка «идём отправлять» ДО запроса в Meta. Короткая запись, транзакция через сеть
-    не живёт. С этого момента «ответа не видели» перестаёт означать «не отправляли»."""
+    не живёт. С этого момента «ответа не видели» перестаёт означать «не отправляли».
+
+    Возвращает число затронутых строк, и это НЕ статистика: ноль означает, что карточку
+    удалили, пока доставка ждала своей очереди на отправку. Проверка стоит здесь, а не
+    отдельным запросом, потому что здесь она атомарна — между «строка есть» и «шлём
+    в Meta» не остаётся зазора.
+    """
     async with pool_ref().connection() as conn:
-        await conn.execute(
+        cur = await conn.execute(
             "UPDATE instagram.ig_delivery"
             "   SET dm_attempts = dm_attempts + 1, updated_at = now() WHERE id = %s",
             (delivery_id,),
         )
+        return cur.rowcount
 
 
 async def clear_dm_attempt(delivery_id: int) -> None:
@@ -371,13 +404,20 @@ async def mark_dm_sent(delivery_id: int, message_id: str) -> None:
         )
 
 
-async def finish_delivery(delivery_id: int, state: str, error: str | None = None) -> None:
+async def finish_delivery(delivery_id: int, state: str, error: str | None = None) -> int:
     async with pool_ref().connection() as conn:
-        await conn.execute(
+        cur = await conn.execute(
             "UPDATE instagram.ig_delivery"
             "   SET state = %s, last_error = %s, updated_at = now() WHERE id = %s",
             (state, error, delivery_id),
         )
+        if not cur.rowcount:
+            # Карточку удалили, пока доставка была в работе. Само по себе это не авария,
+            # но проигранная гонка обязана быть видна: без строки в логе владелец не узнает,
+            # что удаление и отправка разошлись во времени.
+            log.info("доставка %s: карточки уже нет, состояние «%s» записать некуда",
+                     delivery_id, state)
+        return cur.rowcount
 
 
 async def reschedule_delivery(
@@ -478,7 +518,14 @@ async def event_stats() -> dict:
     async with pool_ref().connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
-                "SELECT count(*) AS kept, max(received_at) AS last_at FROM instagram.ig_event"
+                "SELECT count(*) AS kept, max(received_at) AS last_at,"
+                # Номер аккаунта-получателя из последнего уведомления. Пока IG_USER_ID
+                # пуст, это ЕДИНСТВЕННОЕ место, где он вообще есть: сравнивать не с чем,
+                # значит и last_foreign_entry_id не заполняется никогда, — а человеку
+                # именно это число и надо вписать в настройку.
+                "       (SELECT payload->>'entry_id' FROM instagram.ig_event"
+                "         ORDER BY id DESC LIMIT 1) AS last_entry_id"
+                "  FROM instagram.ig_event"
             )
             row = await cur.fetchone()
         try:
@@ -929,11 +976,20 @@ async def admin_find_person(query: str, limit: int) -> list[dict]:
             return await cur.fetchall()
 
 
-async def admin_forget_person(igsid: str) -> tuple[int, int]:
-    """Удаляет всё об одном человеке: карточки обращений и отметки о выдаче материала.
+async def admin_forget_person(igsid: str) -> tuple[int, int, int]:
+    """Удаляет всё об одном человеке: карточки обращений, отметки о выдаче и сырые
+    уведомления от платформы.
 
-    Возвращает (сколько обращений, сколько отметок). Одной транзакцией: половина
-    удаления — это ответ «удалили» и оставшийся текст комментария в базе.
+    Возвращает (обращений, отметок, уведомлений). Одной транзакцией: половина удаления —
+    это ответ «удалили» и оставшийся текст комментария в базе.
+
+    Журнал уведомлений чистится ТРЕТЬИМ запросом, и без него подтверждение врало бы
+    в момент произнесения: `ig_event.payload` хранит сырое тело вебхука целиком, а в нём
+    и идентификатор, и имя пользователя, и текст обращения — до тридцати суток после
+    «удалили всё». Отправителя платформа кладёт в два разных места: у комментария это
+    `value.from.id`, у сообщения в директ — `value.sender.id` (форма разбирается
+    в rules._comment и rules._message). Индекса под такой поиск нет и не нужно: таблица
+    ограничена ретеншеном, а операция разовая и всегда ручная.
 
     Снятая отметка означает, что по тем же правилам человек сможет получить материал
     ещё раз, если обратится снова. Это следствие удаления, а не ошибка: помнить о нём
@@ -948,7 +1004,14 @@ async def admin_forget_person(igsid: str) -> tuple[int, int]:
             cur = await conn.execute(
                 "DELETE FROM instagram.ig_contact_rule WHERE igsid = %s", (igsid,)
             )
-            return deliveries, cur.rowcount
+            holds = cur.rowcount
+            cur = await conn.execute(
+                "DELETE FROM instagram.ig_event"
+                " WHERE payload->'value'->'from'->>'id' = %s"
+                "    OR payload->'value'->'sender'->>'id' = %s",
+                (igsid, igsid),
+            )
+            return deliveries, holds, cur.rowcount
 
 
 async def admin_release_contact(delivery_id: int) -> int:

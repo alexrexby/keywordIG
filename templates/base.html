@@ -71,7 +71,7 @@ footer { max-width: 46rem; margin: 0 auto; padding: 0 1rem 2rem; color: #7a7a7a;
   <a href="/panel/rules" {% if active == 'rules' %}class="on"{% endif %}>Правила</a>
   <a href="/panel/queue" {% if active == 'queue' %}class="on"{% endif %}>Очередь</a>
   <a href="/panel/token" {% if active == 'token' %}class="on"{% endif %}>Токен</a>
-  <a href="/panel/person" {% if active == 'person' %}class="on"{% endif %}>Человек</a>
+  <a href="/panel/person" {% if active == 'person' %}class="on"{% endif %}>Удаление данных</a>
   <form method="post" action="/panel/logout">
     <input type="hidden" name="_csrf" value="{{ csrf }}">
     <button type="submit">Выйти</button>

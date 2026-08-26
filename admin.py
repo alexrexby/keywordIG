@@ -480,6 +480,10 @@ async def state():
             "foreign_24h": foreign_24h,
             "wrong_ig_user_id": handled_24h > 0 and foreign_24h == handled_24h,
             "last_foreign_entry_id": dispatcher.last_foreign_entry_id,
+            # Номер получателя из последнего уведомления. Нужен, пока IG_USER_ID пуст:
+            # сравнивать тогда не с чем, last_foreign_entry_id не заполняется никогда,
+            # а вписать в настройку человеку надо именно это число.
+            "seen_entry_id": events["last_entry_id"],
         },
         # last_ok_at = null при configured = true означает «канал ни разу не проверен»,
         # а не «аварий не было»: это отдельный вердикт, и закрывает его тестовое

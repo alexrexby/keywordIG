@@ -124,6 +124,7 @@ REJECT_LOG_PERIOD_SEC = 60
 # Переменная — КЭШ: источник правды с миграции 006 лежит в instagram.ig_state, иначе
 # рестарт воскрешал бы отозванные сессии, а «Выйти», который не выходит, обманчивее
 # отсутствующей кнопки. Восстанавливается на старте (restore), пишется при выходе.
+# В МИЛЛИСЕКУНДАХ — в тех же единицах, что метка выдачи в cookie.
 _valid_after: float = 0.0
 
 # Параметры scrypt. n=2**14 при r=8 требует 16 МБ на проверку — это заметно для перебора
@@ -170,11 +171,6 @@ NOTES = {
         " сама по себе снятая бронь отправку не запускает."
     ),
     "no-hold": "Брони на этой доставке уже нет — снимать нечего.",
-    "forgotten": (
-        "Удалили всё, что было об этом человеке. Если он обратится снова, сервис"
-        " ответит ему как новому — в том числе выдаст материал ещё раз: помнить,"
-        " что материал уже уходил, значит хранить его идентификатор."
-    ),
 }
 
 
@@ -246,7 +242,12 @@ def _sign(payload: str) -> str:
 
 
 def _issue_session() -> str:
-    payload = f"{secrets.token_urlsafe(12)}.{int(time.time())}"
+    # Момент выдачи в МИЛЛИСЕКУНДАХ, а не в секундах. С секундной точностью отзыв сессий
+    # неразрешим в принципе: сравнение «строго меньше» оставляет живой cookie, выданный
+    # в ту же секунду, в которую нажали «Выйти», а «меньше или равно» убивает свежий вход
+    # сразу после выхода. Миллисекунда разводит эти два события, и оба случая закрываются
+    # одним строгим сравнением. isdigit() при этом продолжает работать — точки нет.
+    payload = f"{secrets.token_urlsafe(12)}.{int(time.time() * 1000)}"
     return f"{payload}.{_sign('session.' + payload)}"
 
 
@@ -269,8 +270,10 @@ def _read_session(raw: str | None) -> str | None:
     if not constant_time_eq(signature, _sign(f"session.{sid}.{issued}")):
         _note_bad_session()
         return None
-    if not issued.isdigit() or time.time() - int(issued) > SESSION_TTL_SEC:
+    if not issued.isdigit() or time.time() * 1000 - int(issued) > SESSION_TTL_SEC * 1000:
         return None
+    # Обе величины в миллисекундах, сравнение строгое: выданное ДО момента выхода
+    # недействительно, выданное после — живо, даже если между ними доли секунды.
     if int(issued) < _valid_after:
         return None  # сессии, отозванные кнопкой «Выйти»
     return sid
@@ -289,7 +292,19 @@ async def restore() -> None:
         log.warning("состояние панели не прочиталось — отзыв сессий начнётся с нуля")
         return
     if row and row["sessions_valid_after"]:
-        _valid_after = row["sessions_valid_after"].timestamp()
+        # Потолок «не позже сейчас»: отметка из будущего — это сломанные часы (NTP правит
+        # убежавший RTC, восстановление из снапшота, миграция между хостами), а не отзыв.
+        # Без потолка она запирает панель наглухо: вход выдаёт cookie, cookie мертва,
+        # объяснения нет, и лечится это только psql — в пакете, который построен так,
+        # чтобы владелец в psql не ходил.
+        stored = row["sessions_valid_after"].timestamp()
+        _valid_after = min(stored, time.time()) * 1000
+        if stored > time.time():
+            log.warning(
+                "панель: отметка отзыва сессий из будущего (%s) — считаю её текущим"
+                " моментом, проверьте часы хоста",
+                row["sessions_valid_after"],
+            )
         log.info("панель: сессии, выданные до %s, недействительны", row["sessions_valid_after"])
 
 
@@ -431,8 +446,22 @@ async def login(request: Request):
     address = _address(request)
     form = await read_form(request)
 
+    # ПОРЯДОК ВАЖЕН: сначала адресный замок, потом общий интервал. Наоборот запертый
+    # адрес продолжал занимать единственный глобальный слот в 250 мс, и владелец
+    # конкурировал с флудом за него на равных — при десяти запросах в секунду входил
+    # один раз из двенадцати, при сотне не входил вовсе. Замок обязан снимать нагрузку,
+    # а не только отказывать.
+    left = _lock_left(address)
+    if left:
+        return _render(
+            "login.html",
+            status=429,
+            error=f"Слишком много попыток. Следующая — через {left} с.",
+        )
+
     # Дешёвый рубеж ПЕРЕД scrypt: сам счёт стоит 60 мс, и поток попыток без него занимал
-    # бы event loop, в котором принимаются вебхуки.
+    # бы event loop, в котором принимаются вебхуки. Ботнет с меняющихся адресов этот слот
+    # всё равно займёт — свойство любого общего ограничителя, закрывается на прокси.
     now = time.monotonic()
     if _login_checked_at is not None and now - _login_checked_at < LOGIN_MIN_INTERVAL_SEC:
         return _render("login.html", status=429, error="Слишком часто. Повторите через секунду.")
@@ -461,13 +490,6 @@ async def login(request: Request):
         )
         return response
 
-    left = _lock_left(address)
-    if left:
-        return _render(
-            "login.html",
-            status=429,
-            error=f"Слишком много попыток. Следующая — через {left} с.",
-        )
     _note_login_fail(address)
     # 401, а не 500 и не 200: неверный пароль — это штатный исход, и он обязан
     # выглядеть как штатный исход в любом логе и в любом мониторинге.
@@ -484,7 +506,7 @@ async def logout(form: dict = Depends(require_form)):
     """
     global _valid_after
     moment = datetime.now(timezone.utc)
-    _valid_after = moment.timestamp()
+    _valid_after = moment.timestamp() * 1000
     try:
         await db.revoke_sessions(moment)
     except Exception:
@@ -739,16 +761,34 @@ def _verdict(facts: dict) -> dict:
         )
 
     if not account["ig_user_id"]:
+        # warn, а не down, и это не смягчение: пустой IG_USER_ID отправку НЕ останавливает.
+        # dispatcher.foreign_account при пустом значении намеренно считает событие своим
+        # («обе неизвестности трактуются в пользу работы, а не тишины»), а свои же
+        # комментарии всё равно отсеиваются — rules.parse_event добавляет entry_id
+        # события в own_ids. Выключены два предохранителя, про них и текст.
+        seen = account["seen_entry_id"]
         return _card(
-            "down",
-            "Сервис не знает, чей аккаунт обслуживает",
+            "warn",
+            "Аккаунт не назван",
             [
-                "IG_USER_ID не заполнен. Без него сервис не отличает свои комментарии"
-                " от чужих и чужие уведомления от ваших: отвечать он не будет никому.",
+                "Поле IG_USER_ID пустое. Отвечать это не мешает — сервис работает, —"
+                " но два предохранителя выключены.",
+                "Первый: если одно приложение Meta подписано на два аккаунта, чужие"
+                " комментарии сервис обслужит вашим токеном. Ответы уйдут от вашего"
+                " имени, и лимиты потратите тоже вы.",
+                "Второй: когда вы вставите токен, сервис не сможет проверить, что тот"
+                " от нужного аккаунта.",
                 "Нужен номер, который Instagram сам ставит в уведомление о комментарии"
                 " (поле entry.id). Второй номер аккаунта выдаётся приложению,"
-                " в уведомлениях не встречается и сюда не годится.",
-                "Впишите его в IG_USER_ID и поднимите сервис заново.",
+                " в уведомлениях не встречается и сюда не годится."
+                + (
+                    f" Из последнего уведомления сервис его уже знает, вот он: {seen}."
+                    if seen
+                    else " Он появится здесь, как только придёт первое уведомление."
+                ),
+                "Впишите номер в IG_USER_ID и поднимите сервис заново. Ошибётесь"
+                " номером — панель покажет правильный, как только придёт следующий"
+                " комментарий.",
             ],
         )
 
@@ -939,9 +979,11 @@ def _summary(facts: dict) -> list[dict]:
                 if account["wrong_ig_user_id"]
                 else account["ig_user_id"]
             ),
+            # Уровень тот же, что у вердикта: пустое поле не останавливает ответы
+            # (warn), а чужой аккаунт останавливает (down).
             "level": (
-                "down"
-                if account["wrong_ig_user_id"] or not account["ig_user_id"]
+                "down" if account["wrong_ig_user_id"]
+                else "warn" if not account["ig_user_id"]
                 else "ok"
             ),
         },
@@ -1218,7 +1260,9 @@ STATE_LABELS = {
 
 
 @router.get("/person", response_class=HTMLResponse)
-async def person_page(sid: str = Depends(require_session), q: str = "", note: str = ""):
+async def person_page(
+    sid: str = Depends(require_session), q: str = "", note: str = "", n: int = 0, m: int = 0
+):
     """Поиск по человеку и удаление всего, что о нём есть.
 
     Заведено не для полноты картины: публичная страница /data-deletion обещает «найдём
@@ -1230,7 +1274,15 @@ async def person_page(sid: str = Depends(require_session), q: str = "", note: st
     return _render(
         "person.html",
         sid=sid,
-        note=NOTES.get(note, ""),
+        # Числа в адресе — это не текст из адреса: FastAPI приводит их к int, и в страницу
+        # попадает число, а не строка. Сам текст по-прежнему живёт в коде.
+        note=(
+            f"Удалили всё, что было об этом человеке: {n} обращений и {m} отметок"
+            " о выдаче. Ответьте на его письмо — на публичной странице мы обещали"
+            " подтвердить, когда закончим."
+            if note == "forgotten"
+            else NOTES.get(note, "")
+        ),
         active="person",
         query=query,
         searched=bool(query),
@@ -1247,6 +1299,31 @@ async def person_page(sid: str = Depends(require_session), q: str = "", note: st
     )
 
 
+@router.get("/person/forget", response_class=HTMLResponse)
+async def person_forget_page(igsid: str, sid: str = Depends(require_session), q: str = ""):
+    """Подтверждение удаления отдельным экраном — как у удаления правила.
+
+    Отменить его нечем, и последствие («человек снова станет необслуженным») человек
+    обязан прочитать ДО нажатия, а не узнать из строки после.
+    """
+    found = await db.admin_find_person(igsid.strip(), 1)
+    if not found:
+        return _render("gone.html", status=404, sid=sid, active="person", what="обращение")
+    row = found[0]
+    return _render(
+        "person_forget.html",
+        sid=sid,
+        active="person",
+        query=q,
+        person={
+            "igsid": row["igsid"],
+            "username": row["username"],
+            "deliveries": row["deliveries"],
+            "holds": row["holds"],
+        },
+    )
+
+
 @router.post("/person/forget")
 async def person_forget(
     sid: str = Depends(require_session), form: dict = Depends(require_form)
@@ -1254,11 +1331,16 @@ async def person_forget(
     igsid = str(form.get("igsid") or "").strip()
     if not igsid:
         return _back("/panel/person")
-    deliveries, holds = await db.admin_forget_person(igsid)
+    deliveries, holds, events = await db.admin_forget_person(igsid)
     # В лог — только числа и идентификатор: имя пользователя и текст обращения человек
     # попросил удалить, и оседать в логах установки они не должны.
-    log.info("удалены данные человека %s: обращений %s, отметок %s", igsid, deliveries, holds)
-    return _back("/panel/person", note="forgotten")
+    log.info(
+        "удалены данные человека %s: обращений %s, отметок %s, уведомлений %s",
+        igsid, deliveries, holds, events,
+    )
+    return RedirectResponse(
+        f"/panel/person?note=forgotten&n={deliveries}&m={holds}", status_code=303
+    )
 
 
 # ---------- Токен ----------

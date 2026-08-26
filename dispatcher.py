@@ -309,11 +309,17 @@ async def deliver(d: dict, token: str) -> None:
     owner = await db.reserve_contact_rule(rule.id, d["igsid"], d["id"])
     if owner == d["id"]:
         await reply_public(d, rule.public_replies, token)
+        if d.get("forgotten"):
+            return
         await send_material(d, rule, token)
+        if d.get("forgotten"):
+            return
         await db.finish_delivery(d["id"], "DONE")
         return
 
     replied = await reply_public(d, rule.duplicate_replies, token)
+    if d.get("forgotten"):
+        return
     # Разные состояния, потому что это разные события для статистики: материал выдан
     # один раз, а ответов на повтор может быть сколько угодно.
     await db.finish_delivery(d["id"], "REPLIED_DUPLICATE" if replied else "SKIPPED_DUPLICATE")
@@ -326,6 +332,11 @@ async def reply_public(d: dict, variants: list[str], token: str) -> bool:
     if d["public_reply_id"]:
         return True  # ответили на прошлой попытке; вторая реплика в ветке не нужна
     await throttle()
+    # Ожидание в очереди отправки — это секунды и десятки секунд, и ровно в них попадает
+    # удаление данных по просьбе человека. Публичный ответ под его комментарием видят
+    # посторонние; отправить его ПОСЛЕ «мы всё удалили» хуже, чем не ответить вовсе.
+    if not await forget_check(d):
+        return False
     # Вариант выбирается из массива, а внутри строки раскрывается {а|б} — в момент
     # отправки, а не при сохранении: в базе лежит шаблон, в ленте — разные реплики.
     text = rules.expand(random.choice(variants))
@@ -342,7 +353,11 @@ async def send_material(d: dict, rule: rules.Rule, token: str) -> None:
     await throttle()
     # Отметка ПОПЫТКИ до запроса: после неё «ответа не видели» уже не читается как
     # «не отправляли», и решение о брони не зависит от знания кодов ошибок Meta.
-    await db.note_dm_attempt(d["id"])
+    # Ноль затронутых строк = карточку удалили, пока мы ждали очереди отправки. Проверка
+    # именно здесь потому, что здесь она атомарна: между ней и POST в Meta нет зазора.
+    if not await db.note_dm_attempt(d["id"]):
+        await forgotten(d)
+        return
     d["dm_attempts"] = (d["dm_attempts"] or 0) + 1
     text = rules.expand(rule.dm_text)
     buttons = render_buttons(rule.dm_buttons)
@@ -367,6 +382,30 @@ async def send_material(d: dict, rule: rules.Rule, token: str) -> None:
     await db.mark_dm_sent(d["id"], message_id or "sent")
     global _budget_used
     _budget_used += 1
+
+
+async def forget_check(d: dict) -> bool:
+    """Карточка ещё на месте? False — человека удалили, и к Meta мы не идём."""
+    if await db.delivery_alive(d["id"]):
+        return True
+    await forgotten(d)
+    return False
+
+
+async def forgotten(d: dict) -> None:
+    """Карточку удалили, пока доставка была в работе: человек попросил его забыть.
+
+    Снимаем и бронь, которую эта доставка успела занять ДО удаления: у ig_contact_rule нет
+    внешнего ключа на ig_delivery (миграция 002), поэтому сама она не уйдёт и останется
+    отметкой о человеке, которого обещали забыть.
+    """
+    log.info("доставка %s: карточку удалили, к Meta не идём", d["id"])
+    # Пометка на СНИМКЕ строки: дальше по deliver() шагов ещё два, и каждый обязан
+    # остановиться. Без неё после публичного ответа мы всё равно шли бы в очередь
+    # отправки — жгли темп и писали вторую строку в лог о том же самом.
+    d["forgotten"] = True
+    if d["rule_id"]:
+        await db.admin_release_contact(d["id"])
 
 
 def render_buttons(buttons: list) -> list[dict]:

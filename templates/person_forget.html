@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block title %}Удалить всё об этом человеке{% endblock %}
+{% block body %}
+<div class="card down">
+  <h1>Удалить всё об этом человеке?</h1>
+  <p>
+    Удалим {{ person.deliveries }} обращений — текст комментария или сообщения, наш ответ
+    и время, — имя пользователя, номер и {{ person.holds }} отметок «материал уже выдавали».
+    Вернуть это будет нечем.
+  </p>
+  <p>
+    Что изменится дальше: вместе с отметками человек снова становится необслуженным.
+    Напишет кодовое слово ещё раз — получит материал заново, как новый. Это не ошибка,
+    так и должно быть: сервис перестаёт его узнавать. Просто не удивляйтесь второй выдаче.
+  </p>
+  <p class="meta">
+    {% if person.username %}@{{ person.username }} · {% endif %}{{ person.igsid }}
+  </p>
+</div>
+<div class="buttons">
+  <form method="post" action="/panel/person/forget">
+    <input type="hidden" name="_csrf" value="{{ csrf }}">
+    <input type="hidden" name="igsid" value="{{ person.igsid }}">
+    <button class="risky" type="submit">Удалить</button>
+  </form>
+  <a href="/panel/person?q={{ query | urlencode }}"><button class="main" type="button">Отмена</button></a>
+</div>
+{% endblock %}

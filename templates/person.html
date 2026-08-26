@@ -1,20 +1,30 @@
 {% extends "base.html" %}
-{% block title %}Данные человека{% endblock %}
+{% block title %}Удаление данных{% endblock %}
 {% block body %}
-<h1>Данные человека</h1>
+<h1>Удаление данных по просьбе человека</h1>
 <p class="hint">
-  Сюда приходят по письму «удалите мои данные» — адрес для таких писем напечатан
-  на странице <a href="/data-deletion">«Удаление данных»</a>. Найдите человека по имени
-  пользователя в Instagram или по его идентификатору и удалите всё, что о нём есть.
+  Сюда приходят после письма на почту, указанную в политике: человек просит удалить всё,
+  что о нём есть. Найдите его, посмотрите, что нашлось, и удалите.
 </p>
 <form method="get" action="/panel/person">
-  <label for="q">Имя пользователя или идентификатор</label>
-  <input type="text" id="q" name="q" value="{{ query }}" placeholder="ann_ivanova или 17841400000000000">
+  <label for="q">Кого ищем</label>
+  <p class="hint">
+    Имя пользователя в Instagram или его номер. По имени найдутся те, кто писал
+    в комментариях: в личных сообщениях платформа имени не передаёт, там у сервиса есть
+    только номер.
+  </p>
+  <input type="text" id="q" name="q" value="{{ query }}">
   <div class="buttons"><button class="main" type="submit">Найти</button></div>
 </form>
 
-{% if searched and not people %}
-<p>Никого не нашли. Имя ищется по части и без учёта регистра, идентификатор — целиком.</p>
+{% if not searched %}
+<p>Введите имя пользователя или номер — покажем всё, что о человеке есть.</p>
+{% elif not people %}
+<p>
+  Ничего не нашлось. Проверьте написание: имя ищется по части, но опечатку не переживёт.
+  Если он писал только в директ, имени у сервиса нет — ищите по номеру или найдите его
+  обращение в очереди по времени.
+</p>
 {% endif %}
 
 {% for person in people %}
@@ -26,17 +36,11 @@
     Обращений: {{ person.deliveries }}{% if person.last_at %}, последнее {{ person.last_at }}{% endif %} ·
     отметок «материал уже выдавали»: {{ person.holds }}
   </p>
-  <p class="hint">
-    Удалим карточки обращений (текст, имя пользователя, наши ответы) и отметки о выдаче.
-    После этого сервис перестанет его узнавать: обратится снова — получит материал ещё раз.
-    Это следствие удаления, а не ошибка: помнить, что материал уже уходил, значит хранить
-    его идентификатор — ровно то, о чём он попросил забыть.
-  </p>
-  <form method="post" action="/panel/person/forget">
-    <input type="hidden" name="_csrf" value="{{ csrf }}">
-    <input type="hidden" name="igsid" value="{{ person.igsid }}">
-    <button class="risky" type="submit">Удалить всё об этом человеке</button>
-  </form>
+  <div class="buttons">
+    <a href="/panel/person/forget?igsid={{ person.igsid | urlencode }}&q={{ query | urlencode }}">
+      <button class="risky" type="button">Удалить всё об этом человеке</button>
+    </a>
+  </div>
 </div>
 {% endfor %}
 {% endblock %}
