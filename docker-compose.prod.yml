@@ -1,0 +1,128 @@
+# Установка целиком: прокси, база, сервис. Ничего внешнего ей не нужно — ни общей базы,
+# ни чужой шины, ни центрального сервера. Файл один: второй («для разработки») означал бы
+# два разных описания одного и того же, и расходиться они начинают на первой же правке.
+
+name: keywordig
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    logging: *default-logging
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      # Пустой домен — не «любой хост»: Caddy откажется стартовать, и вы увидите это
+      # сразу. Порт 80 нужен не только для редиректа: без него не выдадут сертификат.
+      IG_DOMAIN: ${IG_DOMAIN:?задайте домен установки в файле окружения}
+    volumes:
+      # КАТАЛОГ, а не файл. Одиночный bind-mount держится за inode: git pull подменяет
+      # файл целиком, контейнер продолжает читать старую версию, а reload возвращает ноль.
+      # Подробности — в шапке caddy/Caddyfile.
+      - ./caddy:/etc/caddy:ro
+      # Именованные тома, а не каталоги хоста: в них лежат сертификаты, и владелец файлов
+      # на bind-mount ведёт себя по-разному на разных хостах.
+      - caddy_data:/data
+      - caddy_config:/config
+    healthcheck:
+      # Локальный admin API самого Caddy: он отвечает независимо от того, какой домен
+      # настроен, поэтому проверка не врёт на установке с ещё не выданным сертификатом.
+      # Именно 127.0.0.1, а не localhost: Caddy слушает admin на IPv4, а busybox wget
+      # идёт сначала в ::1 и получает «connection refused» на живом сервисе.
+      # Что конфиг ПРИМЕНИЛСЯ, эта проверка не доказывает — это доказывает только
+      # наблюдаемый эффект: 403 с пустым телом на /ig/admin/*.
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:2019/config/ || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    depends_on:
+      - instagram-service
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    logging: *default-logging
+    environment:
+      POSTGRES_USER: ig
+      POSTGRES_DB: ig
+      # ОДНО значение на две роли — суперюзера и ig_service. Разделение прав из-за этого
+      # держится только на схеме (у ig_service нет доступа к public), но не на секрете.
+      # Отдельный пароль суперюзера — вопрос к контракту окружения, а не к этому файлу.
+      POSTGRES_PASSWORD: ${IG_DB_PASSWORD:?задайте пароль базы в файле окружения}
+      # Пароль роли сервиса читает 000_role.sql из ОКРУЖЕНИЯ psql, а не из аргументов:
+      # аргументы видны в `ps aux` любому пользователю хоста.
+      IG_PW: ${IG_DB_PASSWORD:?задайте пароль базы в файле окружения}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Роль и схему заводит суперюзер — сервису это не по правам. Файл отрабатывает
+      # ровно один раз, при создании пустой базы, и больше не читается никогда:
+      # капкан «подменили файл, читается старый» здесь не срабатывает по устройству.
+      - ./migrations/000_role.sql:/docker-entrypoint-initdb.d/000_role.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ig -d ig"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  instagram-service:
+    build: .
+    restart: unless-stopped
+    logging: *default-logging
+    # Окно дожатия текущей доставки на остановке: отмена посреди публичного ответа
+    # даёт вторую реплику под комментарием, когда свипер поднимет строку.
+    # Должно быть больше SHUTDOWN_GRACE_SEC в main.py.
+    stop_grace_period: 30s
+    # Потолок памяти: единственный контейнер, до которого достаёт интернет, а OOM-killer
+    # выбирает жертву на ХОСТЕ — отказ обязан остаться внутри контейнера.
+    mem_limit: 256m
+    # ФАЙЛА ОКРУЖЕНИЯ ЦЕЛИКОМ ЗДЕСЬ НЕТ НАМЕРЕННО: env_file положил бы в интернет-
+    # обращённый контейнер все секреты установки разом, включая пароль суперюзера базы.
+    # Переменные перечисляются по одной; новую добавлять сюда же, по одной.
+    environment:
+      IG_APP_SECRET: ${IG_APP_SECRET:?без App Secret вебхуки принимать нельзя}
+      IG_VERIFY_TOKEN: ${IG_VERIFY_TOKEN:?без verify token не пройдёт проверка подписки}
+      IG_DOMAIN: ${IG_DOMAIN:?задайте домен установки в файле окружения}
+      IG_DATABASE_URL: postgresql://ig_service:${IG_DB_PASSWORD:?задайте пароль базы в файле окружения}@postgres:5432/ig
+      # Токен пустым быть МОЖЕТ: тогда диспетчер стоит на паузе, а приёмник вебхуков
+      # работает. Установка не должна упираться в то, чего у человека ещё нет — токен
+      # выдают последним шагом, когда сервис уже жив и подписка уже настроена.
+      IG_USER_ID: ${IG_USER_ID:-}
+      IG_GRAPH_VERSION: ${IG_GRAPH_VERSION:-v25.0}
+      IG_ACCESS_TOKEN: ${IG_ACCESS_TOKEN:-}
+      IG_TOKEN_KEY: ${IG_TOKEN_KEY:?без ключа конверта токен нельзя ни сохранить, ни прочитать}
+      IG_DISPATCH_RATE: ${IG_DISPATCH_RATE:-20}
+      IG_DAILY_DM_LIMIT: ${IG_DAILY_DM_LIMIT:-50}
+      # Канал аварийных сообщений. Здесь НЕ `:?`: без него сервис работает, просто молча,
+      # и падать из-за этого всем составом значит менять тихий отказ на громкий в худшую
+      # сторону. О ненастроенном канале сервис говорит на старте строкой ERROR, а doctor.sh
+      # спрашивает про него отдельно.
+      IG_ALERT_BOT_TOKEN: ${IG_ALERT_BOT_TOKEN:-}
+      IG_ALERT_CHAT_ID: ${IG_ALERT_CHAT_ID:-}
+      # Пустое значение админку не открывает, а закрывает целиком (fail-closed) —
+      # поэтому и здесь не `:?`.
+      IG_ADMIN_TOKEN: ${IG_ADMIN_TOKEN:-}
+    healthcheck:
+      # /ig/health отдаёт 503, если круг диспетчера замер: безусловные 200 и были той
+      # причиной, по которой немой сервис выглядел здоровым.
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8020/ig/health', timeout=5)\""]
+      interval: 30s
+      timeout: 6s
+      retries: 3
+      start_period: 20s
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  caddy_data:
+  caddy_config:
