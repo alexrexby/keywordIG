@@ -27,10 +27,12 @@ docs/copy.md, там же объяснено, почему первый подх
 и доставка от панели не зависят.
 """
 
+import asyncio
 import base64
 import hashlib
 import hmac
 import logging
+import math
 import random
 import secrets
 import time
@@ -39,7 +41,7 @@ from pathlib import Path
 from urllib.parse import parse_qsl
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from jinja2 import Environment, FileSystemLoader, StrictUndefined, select_autoescape
 
 import admin
@@ -50,10 +52,12 @@ import rules
 from config import (
     DELIVERY_RETENTION_DAYS,
     EVENT_RETENTION_DAYS,
+    HEALTH_STALE_SEC,
     IG_ADMIN_PASSWORD_HASH,
     IG_ADMIN_SECRET,
 )
 from meta import MAX_BUTTONS, MAX_BUTTON_TITLE
+from signature import constant_time_eq
 
 log = logging.getLogger("panel")
 
@@ -72,24 +76,53 @@ TEMPLATES = Environment(
 COOKIE_NAME = "ig_panel"
 LOGIN_PATH = "/panel/login"
 HOME_PATH = "/panel/"
-# Сутки — это смена настроения человека, а не смена человека: панель однопользовательская,
-# и слишком короткая сессия здесь означает ввод пароля посреди починки аварии.
+# Полсуток: панель однопользовательская, а слишком короткая сессия означает ввод пароля
+# посреди починки аварии — с телефона, в спешке, с опечатками.
 SESSION_TTL_SEC = 12 * 60 * 60
+# Подпись сессии — это ВТОРОЙ пароль, а не служебный ключ: cookie самодостаточна, и
+# подобравший ключ входит, не притронувшись к паролю. Замок, scrypt и «пять попыток»
+# стоят на другой двери. token_urlsafe(32) даёт 43 символа — образец окружения советует
+# ровно это, а короткое значение закрывает панель так же, как пустое.
+MIN_SECRET_LEN = 32
 # Онлайн-перебор пароля: /panel/login доступен из интернета по устройству (иначе установку
-# нельзя починить с телефона). Замок общий, не по IP: учётка одна, а адрес за прокси
-# подделывается заголовком. Цена — злоумышленник может держать владельца без входа
-# пятиминутками; она заметно меньше, чем подобранный пароль, и не мешает сервису отвечать
-# людям: доставка от панели не зависит вовсе.
+# нельзя починить с телефона).
+#
+# ПАРОЛЬ СВЕРЯЕТСЯ ДО ЗАМКА, и это не послабление. Замок «до» отвергал верный пароль:
+# пять запросов раз в пять минут из одной консоли — и владелец не входит НИКОГДА, а
+# панель у него единственный способ заменить умерший токен без ssh. Того же добивается
+# без умысла первый попавшийся сканер админок. Защита, которая защищает от хозяина,
+# в этом пакете дороже перебора.
+#
+# Перебор ограничен иначе: счёт неудач ПО АДРЕСУ (Caddy подставляет свой X-Forwarded-For
+# и входящему не верит — проверено ревью на боевом Caddyfile) плюс дешёвый глобальный
+# интервал между проверками, чтобы поток попыток не занимал event loop счётом scrypt.
 LOGIN_FAILS_BEFORE_LOCK = 5
 LOGIN_LOCK_SEC = 300
+# Минимальный промежуток между двумя проверками пароля во всём процессе. Дешёвый рубеж
+# ПЕРЕД scrypt: сам счёт стоит 60 мс, и без него поток попыток тормозил бы приём вебхуков.
+LOGIN_MIN_INTERVAL_SEC = 0.25
+# Сколько адресов помним. Словарь без потолка — это память, которую наполняет улица.
+LOGIN_ADDRESSES = 100
 # Форма правила — единицы килобайт: тексты ответов ограничены 4096 байтами каждый.
 # Рубеж здесь ЕДИНСТВЕННЫЙ: request_body max_size из Caddyfile живёт внутри handle /ig/*,
 # а /panel/* попадает в другой блок — тот же расклад, что у admin.MAX_ADMIN_BODY_BYTES.
 MAX_FORM_BYTES = 64 * 1024
 # Ноль здесь означал бы «замок только что кончился» на хосте, загрузившемся минуту назад:
 # time.monotonic() считается от загрузки ХОСТА. Тот же капкан чинили в диспетчере.
-_login_fails = 0
-_login_locked_at: float | None = None
+_login_fails: dict[str, int] = {}
+_login_locked_at: dict[str, float] = {}
+_login_checked_at: float | None = None
+# Отказы по подписи сессии: подделку cookie иначе не видно вообще ничем — в отличие от
+# пароля, у неё нет ни счётчика, ни замка. Пишем сводкой, как main.note_rejected:
+# строка на каждый отказ — это заливка логов с улицы.
+_bad_session_total = 0
+_bad_session_logged_at: float | None = None
+REJECT_LOG_PERIOD_SEC = 60
+# Сессии, выданные раньше этого момента, недействительны. Кнопка «Выйти» иначе гасит
+# cookie только в ЭТОМ браузере, а подписанный токен живёт своей жизнью ещё 12 часов —
+# при том, что панель открывают в том числе с чужого телефона. Переменная процесса:
+# после рестарта отзыв теряется, и это честно сказано в отчёте, а не спрятано.
+_valid_after: float = 0.0
 
 # Параметры scrypt. n=2**14 при r=8 требует 16 МБ на проверку — это заметно для перебора
 # и незаметно для одного входа в сутки; в контейнере с mem_limit 256m помещается.
@@ -102,14 +135,13 @@ SCRYPT_MAX_N = 2**20
 # Сколько раскрытий показывает предпросмотр. Столько же, сколько отдаёт машинный
 # /ig/admin/preview: разное число примеров в двух местах читается как разное поведение.
 PREVIEW_SAMPLES = admin.PREVIEW_SAMPLES
+# За сколько суток до конца срока говорить про токен вслух. Столько же, за сколько
+# сервис начинает продлевать (tokens.REFRESH_BEFORE_DAYS): попав в это окно и оставшись
+# в нём, токен сообщает, что продление не проходит.
+TOKEN_WARN_DAYS = 10
 # Молчание платформы дольше этого срока — повод сказать вслух. Не авария: под постами
 # просто может быть тихо, поэтому вердикт предлагает проверку, а не починку.
 SILENCE_ALERT_DAYS = 3
-# Тот же порог, что у /ig/health (main.HEALTH_STALE_SEC). Импортом не берётся: main
-# импортирует panel, обратный импорт замкнул бы круг. Разъедутся — health и панель скажут
-# про один и тот же круг диспетчера разное, поэтому меняются вместе.
-STALE_SEC = 120
-
 # Микрокопия ответов на действие. Коды, а не тексты, ездят в query-строке: подставлять
 # в страницу произвольную строку из адреса — это отражённый XSS даже при автоэкранировании
 # (человек прочитает в панели то, что ему прислали ссылкой).
@@ -132,6 +164,7 @@ NOTES = {
         "Бронь снята. Материал уйдёт этому человеку, когда он обратится снова:"
         " сама по себе снятая бронь отправку не запускает."
     ),
+    "no-hold": "Брони на этой доставке уже нет — снимать нечего.",
 }
 
 
@@ -204,20 +237,46 @@ def _sign(payload: str) -> str:
 
 def _issue_session() -> str:
     payload = f"{secrets.token_urlsafe(12)}.{int(time.time())}"
-    return f"{payload}.{_sign(payload)}"
+    return f"{payload}.{_sign('session.' + payload)}"
 
 
 def _read_session(raw: str | None) -> str | None:
-    """Идентификатор живой сессии или None. Почему именно не пустили, наружу не сообщаем."""
+    """Идентификатор живой сессии или None. Почему именно не пустили, наружу не сообщаем.
+
+    Сверка через signature.constant_time_eq, а не hmac.compare_digest напрямую: на СТРОКАХ
+    тот требует ASCII в обоих аргументах и иначе бросает TypeError. Cookie starlette
+    декодирует как latin-1, тело формы — как utf-8, то есть не-ASCII доезжает сюда обоими
+    путями и превращал бы каждый такой запрос в 500 с пятью килобайтами трейса — ротацию
+    лога установки вымывает парой тысяч запросов с улицы. Ровно это уже чинили в
+    signature.py, функция лежит там же.
+    """
     parts = (raw or "").split(".")
     if len(parts) != 3:
+        if raw:
+            _note_bad_session()
         return None
     sid, issued, signature = parts
-    if not hmac.compare_digest(signature, _sign(f"{sid}.{issued}")):
+    if not constant_time_eq(signature, _sign(f"session.{sid}.{issued}")):
+        _note_bad_session()
         return None
     if not issued.isdigit() or time.time() - int(issued) > SESSION_TTL_SEC:
         return None
+    if int(issued) < _valid_after:
+        return None  # сессии, отозванные кнопкой «Выйти»
     return sid
+
+
+def _note_bad_session() -> None:
+    """Счёт подделок cookie. Ни значения, ни адреса: строка в лог на каждый отказ — это
+    и есть заливка логов, от которой лог перестаёт быть диагностическим каналом."""
+    global _bad_session_total, _bad_session_logged_at
+    _bad_session_total += 1
+    now = time.monotonic()
+    if _bad_session_logged_at is None or now - _bad_session_logged_at >= REJECT_LOG_PERIOD_SEC:
+        _bad_session_logged_at = now
+        log.warning(
+            "панель: отказ по подписи сессии; всего с рестарта: %s", _bad_session_total
+        )
 
 
 def _csrf(sid: str) -> str:
@@ -239,6 +298,14 @@ def _closed_reason() -> str:
         return (
             "Панель закрыта: не задан IG_ADMIN_SECRET — подписывать сессию нечем."
             " Задайте его в файле окружения и поднимите сервис заново."
+        )
+    if len(IG_ADMIN_SECRET) < MIN_SECRET_LEN:
+        return (
+            f"Панель закрыта: IG_ADMIN_SECRET короче {MIN_SECRET_LEN} символов."
+            " Этим ключом подписана сессия, и подобрать его — то же самое, что узнать"
+            " пароль, только без пароля. Возьмите длинный:"
+            " python3 -c 'import secrets; print(secrets.token_urlsafe(32))'"
+            " — и поднимите сервис заново."
         )
     if _parsed_hash() is None:
         return (
@@ -304,7 +371,8 @@ async def require_form(request: Request, sid: str = Depends(require_session)) ->
     """
     form = await read_form(request)
     given = str(form.get("_csrf") or "")
-    if not hmac.compare_digest(given, _csrf(sid)):
+    # Байтами (см. _read_session): не-ASCII в поле формы иначе даёт 500 вместо честного 403.
+    if not constant_time_eq(given, _csrf(sid)):
         raise HTTPException(
             status_code=403,
             detail="Страница устарела или пришла не из панели. Откройте её заново.",
@@ -332,54 +400,98 @@ async def login_page(request: Request):
 @login_router.post("/login")
 async def login(request: Request):
     require_open()
-    global _login_fails, _login_locked_at
-    left = _lock_left()
+    global _login_checked_at
+    address = _address(request)
+    form = await read_form(request)
+
+    # Дешёвый рубеж ПЕРЕД scrypt: сам счёт стоит 60 мс, и поток попыток без него занимал
+    # бы event loop, в котором принимаются вебхуки.
+    now = time.monotonic()
+    if _login_checked_at is not None and now - _login_checked_at < LOGIN_MIN_INTERVAL_SEC:
+        return _render("login.html", status=429, error="Слишком часто. Повторите через секунду.")
+    _login_checked_at = now
+
+    # scrypt в отдельном потоке: 16 МБ и 60 мс в общем цикле — это пауза в приёме
+    # вебхуков ровно тогда, когда кто-то ломится в панель.
+    ok = await asyncio.to_thread(check_password, str(form.get("password") or ""))
+    if ok:
+        # ВЕРНЫЙ ПАРОЛЬ ПРОХОДИТ ВСЕГДА, замок он же и снимает: иначе пять чужих попыток
+        # раз в пять минут держат владельца снаружи, а внутри — единственная кнопка
+        # замены умершего токена.
+        _login_fails.pop(address, None)
+        _login_locked_at.pop(address, None)
+        response = RedirectResponse(HOME_PATH, status_code=303)
+        response.set_cookie(
+            COOKIE_NAME,
+            _issue_session(),
+            max_age=SESSION_TTL_SEC,
+            httponly=True,
+            # Secure — не перестраховка: callback URL Meta принимает только HTTPS, значит
+            # установка без TLS не работает в принципе, и незашифрованного входа здесь нет.
+            secure=True,
+            samesite="strict",
+            path="/panel",
+        )
+        return response
+
+    left = _lock_left(address)
     if left:
         return _render(
             "login.html",
             status=429,
             error=f"Слишком много попыток. Следующая — через {left} с.",
         )
-    form = await read_form(request)
-    if not check_password(str(form.get("password") or "")):
-        _login_fails += 1
-        if _login_fails >= LOGIN_FAILS_BEFORE_LOCK:
-            _login_locked_at = time.monotonic()
-            _login_fails = 0
-            log.warning("панель: вход закрыт на %s с после неудачных попыток", LOGIN_LOCK_SEC)
-        # 401, а не 500 и не 200: неверный пароль — это штатный исход, и он обязан
-        # выглядеть как штатный исход в любом логе и в любом мониторинге.
-        return _render("login.html", status=401, error="Пароль не подошёл.")
-    _login_fails = 0
-    _login_locked_at = None
-    response = RedirectResponse(HOME_PATH, status_code=303)
-    response.set_cookie(
-        COOKIE_NAME,
-        _issue_session(),
-        max_age=SESSION_TTL_SEC,
-        httponly=True,
-        # Secure — не перестраховка: callback URL Meta принимает только HTTPS, значит
-        # установка без TLS не работает в принципе, и незашифрованного входа здесь нет.
-        secure=True,
-        samesite="strict",
-        path="/panel",
-    )
-    return response
+    _note_login_fail(address)
+    # 401, а не 500 и не 200: неверный пароль — это штатный исход, и он обязан
+    # выглядеть как штатный исход в любом логе и в любом мониторинге.
+    return _render("login.html", status=401, error="Пароль не подошёл.")
 
 
 @router.post("/logout")
 async def logout(form: dict = Depends(require_form)):
+    """Выход гасит и cookie, и саму подпись: cookie убирается у этого браузера, а
+    выданные до сих пор сессии перестают приниматься. Панель открывают с чужого телефона
+    в момент аварии — кнопка «Выйти» обязана делать то, что обещает."""
+    global _valid_after
+    _valid_after = time.time()
     response = RedirectResponse(LOGIN_PATH, status_code=303)
     response.delete_cookie(COOKIE_NAME, path="/panel")
     return response
 
 
-def _lock_left() -> int:
-    """Сколько секунд осталось до конца замка. 0 — замка нет."""
-    if _login_locked_at is None:
+def _address(request: Request) -> str:
+    """Адрес, с которого пришла попытка. За Caddy заголовку можно верить: он не доверяет
+    входящему X-Forwarded-For и подставляет свой (проверено ревью на боевом Caddyfile),
+    поэтому берём последний элемент, а без прокси падаем на адрес соединения."""
+    forwarded = request.headers.get("x-forwarded-for", "")
+    if forwarded:
+        return forwarded.split(",")[-1].strip()[:64]
+    return request.client.host if request.client else "-"
+
+
+def _note_login_fail(address: str) -> None:
+    global _login_fails
+    if len(_login_fails) >= LOGIN_ADDRESSES:
+        # Словарь без потолка наполняет улица. Забываем всё разом, а не по одному:
+        # выбирать «наименее важный» адрес не на чем, а замок — вещь короткая.
+        _login_fails.clear()
+    _login_fails[address] = _login_fails.get(address, 0) + 1
+    if _login_fails[address] >= LOGIN_FAILS_BEFORE_LOCK:
+        _login_locked_at[address] = time.monotonic()
+        _login_fails.pop(address, None)
+        log.warning("панель: подбор пароля с %s — закрыт на %s с", address, LOGIN_LOCK_SEC)
+
+
+def _lock_left(address: str) -> int:
+    """Сколько секунд осталось до конца замка для этого адреса. 0 — замка нет."""
+    locked_at = _login_locked_at.get(address)
+    if locked_at is None:
         return 0
-    left = LOGIN_LOCK_SEC - (time.monotonic() - _login_locked_at)
-    return int(left) + 1 if left > 0 else 0
+    left = LOGIN_LOCK_SEC - (time.monotonic() - locked_at)
+    if left <= 0:
+        _login_locked_at.pop(address, None)
+        return 0
+    return int(left) + 1
 
 
 # ---------- Состояние ----------
@@ -433,8 +545,8 @@ def _verdict(facts: dict) -> dict:
             "Отвечать нечем",
             [
                 "Уведомления от Instagram сервис принимает, но ответить на них не может:"
-                " токена нет. Всё, что придёт до этого момента, копится в очереди и уйдёт"
-                " само, как только токен появится.",
+                f" токена нет. Уже ждут ответа: {pending}. Всё, что придёт до этого"
+                " момента, копится в очереди и уйдёт само, как только токен появится.",
                 "Пройдите Instagram Business Login под своим аккаунтом и вставьте токен.",
             ],
             action=("Вставить токен", "/panel/token"),
@@ -452,6 +564,66 @@ def _verdict(facts: dict) -> dict:
                 " токен. Перезапускать сервис не нужно — очередь разберётся сама.",
             ],
             action=("Вставить новый токен", "/panel/token"),
+        )
+
+    expires_at = _at(token["expires_at"])
+    if expires_at is not None and token["present"]:
+        left_sec = (expires_at - datetime.now(timezone.utc)).total_seconds()
+        if left_sec <= 0 and token["expires_at_confirmed"]:
+            return _card(
+                "down",
+                "Срок доступа к Instagram истёк",
+                [
+                    f"Meta называла срок до {_when(token['expires_at'])}, продлить его"
+                    " сервис не смог. Автоответы могут ещё идти по инерции, но следующий"
+                    " же отказ платформы остановит их совсем.",
+                    "Токен живёт 60 суток и после смерти не восстанавливается: пройдите"
+                    " Instagram Business Login и вставьте свежий.",
+                ],
+                action=("Вставить новый токен", "/panel/token"),
+            )
+        if left_sec <= 0:
+            return _card(
+                "warn",
+                "Продление доступа не проходит",
+                [
+                    "Сервис продлевает токен сам, но Meta уже которые сутки не"
+                    f" подтверждает срок: последняя отметка — {_when(token['expires_at'])}."
+                    " Пока автоответы работают, но проверить это нечем, кроме живого"
+                    " комментария.",
+                    "Надёжнее не ждать: пройдите Instagram Business Login и вставьте"
+                    " свежий токен — счёт пойдёт заново.",
+                ],
+                action=("Вставить новый токен", "/panel/token"),
+            )
+        if token["expires_at_confirmed"] and left_sec < TOKEN_WARN_DAYS * 86400:
+            return _card(
+                "warn",
+                # Вверх, а не вниз: «через 3 суток» при трёх сутках и 23 часах — занижение,
+                # а человек по этому числу решает, идти ли ему за токеном сегодня.
+                f"Доступ истекает через {_days(math.ceil(left_sec / 86400))}",
+                [
+                    "Сервис продлевает токен сам и обычно делает это заранее. Раз срок"
+                    " всё ещё близко, продление не проходит — а после истечения токен"
+                    " не восстанавливается никак.",
+                    "Не дожидаясь: пройдите Instagram Business Login и вставьте свежий"
+                    " токен.",
+                ],
+                action=("Вставить новый токен", "/panel/token"),
+            )
+
+    stale = facts["dispatcher"]["stale_sec"]
+    if facts["dispatcher"]["last_tick_at"] is None or (stale is not None and stale > HEALTH_STALE_SEC):
+        return _card(
+            "down",
+            "Отправка встала: сервис не делает круг",
+            [
+                "Приём уведомлений работает и ничего не теряется, но материал сейчас"
+                " никому не уходит. Сервис перезапустит себя сам в течение минуты —"
+                " обновите страницу.",
+                "Если это держится дольше пары минут, перезапуск не помогает: смотрите"
+                " логи контейнера, docker compose logs --tail=100 instagram-service.",
+            ],
         )
 
     if not alerts["configured"]:
@@ -495,19 +667,6 @@ def _verdict(facts: dict) -> dict:
             action=("Отправить проверочное сообщение", "/panel/alerts/test", True),
         )
 
-    if pending and not token["present"]:
-        return _card(
-            "down",
-            f"Очередь стоит: {pending} чел. ждут ответа",
-            [
-                "Люди написали кодовое слово, а материал им не ушёл — сервису нечем"
-                " отправлять. Ничего не потеряется: очередь уйдёт сама, как только доступ"
-                " вернётся. Но окно у платформы не бесконечное — на комментарий отвечают"
-                " 7 суток, на сообщение в директ 24 часа.",
-            ],
-            action=("Вставить новый токен", "/panel/token"),
-        )
-
     if daily["reached"]:
         return _card(
             "warn",
@@ -542,7 +701,26 @@ def _verdict(facts: dict) -> dict:
             action=("Посмотреть очередь", "/panel/queue"),
         )
 
+    if not account["ig_user_id"]:
+        return _card(
+            "down",
+            "Сервис не знает, чей аккаунт обслуживает",
+            [
+                "IG_USER_ID не заполнен. Без него сервис не отличает свои комментарии"
+                " от чужих и чужие уведомления от ваших: отвечать он не будет никому.",
+                "Нужен номер, который Instagram сам ставит в уведомление о комментарии"
+                " (поле entry.id). Второй номер аккаунта выдаётся приложению,"
+                " в уведомлениях не встречается и сюда не годится.",
+                "Впишите его в IG_USER_ID и поднимите сервис заново.",
+            ],
+        )
+
     if account["wrong_ig_user_id"]:
+        # Номер живёт в памяти процесса (dispatcher.last_foreign_entry_id), а сам вердикт
+        # считается по суточным счётчикам из базы — те рестарт переживают. Значит после
+        # перезапуска номера может не быть, и печатать «впишите None» нельзя: человек
+        # получит инструкцию, которую нельзя выполнить.
+        seen = account["last_foreign_entry_id"]
         return _card(
             "down",
             "Ни на один комментарий не ответили: сервис слушает другой аккаунт",
@@ -554,13 +732,23 @@ def _verdict(facts: dict) -> dict:
                 " и в настройки попал не тот. Нужен тот, который Instagram сам ставит"
                 " в уведомление о комментарии; второй выдаётся приложению,"
                 " в уведомлениях не встречается и сюда не годится.",
-                "Номер из уведомления сервис уже видел, вот он:"
-                f" {account['last_foreign_entry_id']}."
-                f" Сейчас в настройках стоит {account['ig_user_id']}.",
-                f"Если {account['last_foreign_entry_id']} — ваш аккаунт, впишите это"
-                " число в IG_USER_ID и поднимите сервис заново. Если аккаунт правда"
-                " чужой, значит одно приложение Meta подписано на два аккаунта."
-                " Так нельзя: второй молча перехватывает события первого.",
+                (
+                    f"Номер из уведомления сервис уже видел, вот он: {seen}."
+                    f" Сейчас в настройках стоит {account['ig_user_id']}."
+                    if seen
+                    else "Номер из уведомления сервис показывал до перезапуска и покажет"
+                    " снова со следующим комментарием — загляните сюда после него."
+                    f" Сейчас в настройках стоит {account['ig_user_id']}."
+                ),
+                (
+                    f"Если {seen} — ваш аккаунт, впишите это число в IG_USER_ID"
+                    " и поднимите сервис заново."
+                    if seen
+                    else "Если номер из уведомления окажется вашим — впишите его"
+                    " в IG_USER_ID и поднимите сервис заново."
+                )
+                + " Если аккаунт правда чужой, значит одно приложение Meta подписано"
+                " на два аккаунта. Так нельзя: второй молча перехватывает события первого.",
             ],
         )
 
@@ -584,13 +772,25 @@ def _verdict(facts: dict) -> dict:
         )
 
     silent = _days_since(hooks["last_at"])
+    if hooks["ever_received"] and hooks["last_at"] is None:
+        # Уведомления когда-то приходили, а в журнале пусто: значит последнее старше
+        # EVENT_RETENTION_DAYS и его вычистил ретеншен. Без этой строки самая долгая
+        # тишина из возможных проваливалась в «Сервис отвечает» — зелёным.
+        silent = EVENT_RETENTION_DAYS
     if silent is not None and silent >= SILENCE_ALERT_DAYS:
         return _card(
-            "warn",
+            # Журнал пуст — значит тишина заведомо длиннее срока хранения, и это уже
+            # не «под постами тихо», а самая долгая тишина из возможных.
+            "down" if hooks["last_at"] is None else "warn",
             f"Тишина уже {_days(silent)}",
             [
-                f"Последнее уведомление от Instagram пришло {_when(hooks['last_at'])}."
-                " Это может быть нормой — под постами просто никто не пишет кодовых"
+                (
+                    f"Последнее уведомление от Instagram пришло {_when(hooks['last_at'])}."
+                    if hooks["last_at"]
+                    else "Последнее уведомление приходило так давно, что журнал его уже"
+                    f" не хранит: он живёт {_days(EVENT_RETENTION_DAYS)}."
+                )
+                + " Это может быть нормой — под постами просто никто не пишет кодовых"
                 " слов. А может быть тишиной после поломки: отвалилась подписка,"
                 " сменился домен, приложение ушло на проверку.",
                 "Отличить одно от другого можно за минуту: оставьте комментарий"
@@ -625,12 +825,24 @@ def _summary(facts: dict) -> list[dict]:
     alerts = facts["alerts"]
     account = facts["account"]
 
+    expires_at = _at(token["expires_at"])
+    left_sec = (
+        (expires_at - datetime.now(timezone.utc)).total_seconds() if expires_at else None
+    )
     if not token["present"]:
         token_line, token_level = "не вставлен", "down"
     elif token["invalid_at"]:
         token_line, token_level = "отвергнут Instagram", "down"
-    elif token["expires_at_confirmed"]:
-        token_line, token_level = f"живой, продлеваем до {_when(token['expires_at'])}", "ok"
+    elif left_sec is not None and left_sec <= 0:
+        # Дата в прошлом и слово «живой» рядом — это и есть зелёное поверх сломанного.
+        token_line, token_level = (
+            f"срок истёк {_when(token['expires_at'])}, продлить не удалось",
+            "down" if token["expires_at_confirmed"] else "warn",
+        )
+    elif token["expires_at_confirmed"] and left_sec is not None:
+        days = math.ceil(left_sec / 86400)
+        token_line = f"живой, срок до {_when(token['expires_at'])}"
+        token_level = "warn" if days < TOKEN_WARN_DAYS else "ok"
     else:
         # Обратный отсчёт по неподтверждённому сроку соврал бы: до первого продления
         # в expires_at стоит горизонт зонда, а не срок жизни токена.
@@ -638,9 +850,14 @@ def _summary(facts: dict) -> list[dict]:
 
     if not hooks["ever_received"]:
         hooks_line, hooks_level = "не приходили ни разу", "down"
+    elif hooks["last_at"] is None:
+        # Журнал вычищен ретеншеном, нового не приходило: тишина дольше срока хранения.
+        hooks_line = f"тишина дольше {_days(EVENT_RETENTION_DAYS)} — журнал пуст"
+        hooks_level = "down"
     else:
+        silent = _days_since(hooks["last_at"]) or 0
         hooks_line = f"последнее {_when(hooks['last_at'])}, в журнале {hooks['kept']}"
-        hooks_level = "ok"
+        hooks_level = "warn" if silent >= SILENCE_ALERT_DAYS else "ok"
 
     if alerts["last_error"]:
         alerts_line, alerts_level = f"не работает — {alerts['last_error']}", "down"
@@ -666,17 +883,30 @@ def _summary(facts: dict) -> list[dict]:
         {
             "label": "За сутки",
             "text": (
-                f"{daily['sent_24h']} отправлено, потолок снят"
+                f"{daily['sent_24h']} отправлено, потолок снят —"
+                " сервис отправит столько, сколько попросят"
                 if not daily["limit"]
                 else f"{daily['sent_24h']} из {daily['limit']}"
             ),
-            "level": "warn" if daily["reached"] else "ok",
+            # Снятый предохранитель — не «ок»: рискует аккаунт владельца установки,
+            # а не сервер, и на экране «всё ли в порядке» это должно быть видно.
+            "level": "warn" if daily["reached"] or not daily["limit"] else "ok",
         },
         {"label": "Алерты", "text": alerts_line, "level": alerts_level},
         {
             "label": "Аккаунт",
-            "text": account["ig_user_id"] or "не задан: IG_USER_ID пуст",
-            "level": "warn" if not account["ig_user_id"] else "ok",
+            "text": (
+                "не задан: IG_USER_ID пуст"
+                if not account["ig_user_id"]
+                else f"{account['ig_user_id']} — уведомления приходят чужому аккаунту"
+                if account["wrong_ig_user_id"]
+                else account["ig_user_id"]
+            ),
+            "level": (
+                "down"
+                if account["wrong_ig_user_id"] or not account["ig_user_id"]
+                else "ok"
+            ),
         },
         {
             "label": "Хранение",
@@ -690,7 +920,15 @@ def _summary(facts: dict) -> list[dict]:
         },
     ]
     stale = facts["dispatcher"]["stale_sec"]
-    if stale is not None and stale > STALE_SEC:
+    if facts["dispatcher"]["last_tick_at"] is None:
+        rows.append(
+            {
+                "label": "Круг доставки",
+                "text": "не начинался ни разу — отправка не работает",
+                "level": "down",
+            }
+        )
+    elif stale is not None and stale > HEALTH_STALE_SEC:
         rows.append(
             {
                 "label": "Круг доставки",
@@ -827,12 +1065,17 @@ async def rule_copy(
     rule_id: int, sid: str = Depends(require_session), form: dict = Depends(require_form)
 ):
     row, errors, warnings = await admin.duplicate_rule(rule_id)
-    if row is None:
-        return _render("gone.html", status=404, sid=sid, active="rules", what="правило")
+    # Порядок тот же, что в машинном API: сперва причина отказа, и только потом «нечего
+    # копировать». Обратный порядок показывал «правило уже удалено» вместо настоящей причины.
     if errors:
-        view = admin.rule_view(await db.admin_get_rule(rule_id))
+        current = await db.admin_get_rule(rule_id)
+        if current is None:
+            return _render("gone.html", status=404, sid=sid, active="rules", what="правило")
+        view = admin.rule_view(current)
         return _render("rule.html", status=400, sid=sid, note="",
                        **_form_context(view, rule=view, errors=errors))
+    if row is None:
+        return _render("gone.html", status=404, sid=sid, active="rules", what="правило")
     view = admin.rule_view(row)
     return _render(
         "rule.html", sid=sid, note=NOTES["copied"],
@@ -873,6 +1116,9 @@ async def rule_delete(
 @router.get("/queue", response_class=HTMLResponse)
 async def queue_page(sid: str = Depends(require_session), note: str = ""):
     rows = await db.admin_list_deliveries(admin.DELIVERIES_PAGE)
+    # Брони, чья карточка уже вычищена ретеншеном: без отдельного списка снять такую
+    # из панели нельзя вообще никак — кнопку рисует строка очереди, а строки больше нет.
+    orphans = await db.admin_orphan_holds(admin.DELIVERIES_PAGE)
     return _render(
         "queue.html",
         sid=sid,
@@ -889,6 +1135,15 @@ async def queue_page(sid: str = Depends(require_session), note: str = ""):
             }
             for row in rows
         ],
+        orphans=[
+            {
+                "delivery_id": row["delivery_id"],
+                "igsid": row["igsid"],
+                "rule_name": row["rule_name"],
+                "when": _when(_moment(row["created_at"])),
+            }
+            for row in orphans
+        ],
         retention=DELIVERY_RETENTION_DAYS,
     )
 
@@ -899,7 +1154,7 @@ async def queue_release(
 ):
     released = await db.admin_release_contact(delivery_id)
     if not released:
-        return _back("/panel/queue", warnings=[f"на доставке {delivery_id} брони уже нет"])
+        return _back("/panel/queue", note="no-hold")
     log.info("доставка %s: бронь снята из панели", delivery_id)
     return _back("/panel/queue", note="released")
 
@@ -934,25 +1189,48 @@ async def token_page(sid: str = Depends(require_session), note: str = ""):
         note=NOTES.get(note, ""),
         active="token",
         token=facts["token"],
+        invalid_at=_when(facts["token"]["invalid_at"]),
+        expires_at=_when(facts["token"]["expires_at"]),
         error="",
     )
 
 
 @router.post("/token")
 async def token_save(sid: str = Depends(require_session), form: dict = Depends(require_form)):
+    """Замена токена — только по явно нажатой кнопке.
+
+    Поле-НАМЕРЕНИЕ, а не надежда на атрибуты разметки: страница живёт на том же адресе,
+    где браузер сохранил пароль от панели, и менеджер паролей охотно подставляет его
+    в одинокое поле. Записанный поверх живого токена пароль стирает единственную копию
+    (строка в ig_token одна, истории нет) и следующим кругом уезжает в чужие логи
+    параметром запроса на продление. Атрибут autocomplete Chromium для полей пароля
+    игнорирует по документированному поведению — поэтому поле обычное текстовое,
+    а решение принимает нажатие.
+    """
+    if str(form.get("__set__token") or "") != "1":
+        facts = await admin.state()
+        return _render(
+            "token.html", status=400, sid=sid, note="", active="token",
+            token=facts["token"], invalid_at=_when(facts["token"]["invalid_at"]),
+            expires_at=_when(facts["token"]["expires_at"]),
+            error="Нажмите кнопку «Вставить токен» — форма пришла без неё.",
+        )
     value = str(form.get("token") or "").strip()
     if not value:
         facts = await admin.state()
         return _render(
             "token.html", status=400, sid=sid, note="", active="token",
-            token=facts["token"], error="Поле пустое — вставлять нечего.",
+            token=facts["token"], invalid_at=_when(facts["token"]["invalid_at"]),
+            expires_at=_when(facts["token"]["expires_at"]),
+            error="Поле пустое — вставлять нечего.",
         )
     expires_at, error = await admin.accept_token(value)
     if error:
         facts = await admin.state()
         return _render(
             "token.html", status=400, sid=sid, note="", active="token",
-            token=facts["token"], error=error,
+            token=facts["token"], invalid_at=_when(facts["token"]["invalid_at"]),
+            expires_at=_when(facts["token"]["expires_at"]), error=error,
         )
     return _back("/panel/token", note="token")
 
@@ -1162,6 +1440,38 @@ def _days_since(value: str | None) -> int | None:
     if moment is None:
         return None
     return int((datetime.now(timezone.utc) - moment).total_seconds() // 86400)
+
+
+# ---------- Отказы ----------
+
+
+async def on_http_error(request: Request, exc: HTTPException):
+    """Отказ панели — страницей, а не JSON'ом: на той стороне человек в браузере.
+
+    Тексты у отказов правильные (fail-closed, устаревшая форма, слишком большое тело),
+    оболочка была нет: `{"detail": …}` посреди аварии читается как поломка панели.
+    Редиректы (302 на форму входа) проходят насквозь — это не отказ.
+    """
+    if not request.url.path.startswith("/panel"):
+        return JSONResponse({"detail": exc.detail}, status_code=exc.status_code,
+                            headers=exc.headers)
+    if 300 <= exc.status_code < 400 and (exc.headers or {}).get("Location"):
+        return RedirectResponse(exc.headers["Location"], status_code=exc.status_code)
+    return _render("closed.html", status=exc.status_code, sid="", active="",
+                   reason=str(exc.detail))
+
+
+async def on_error(request: Request, exc: Exception):
+    """Всё, что не поймали: почти всегда это упавшая база.
+
+    Панель — единственный инструмент диагностики установки, и голый «Internal Server
+    Error» на английском не даёт человеку отличить «упала база» от «сломалась панель».
+    Приём вебхуков при этом продолжает работать, и сказать об этом важнее всего.
+    """
+    log.exception("панель: необработанный отказ на %s", request.url.path)
+    if not request.url.path.startswith("/panel"):
+        return JSONResponse({"error": "internal"}, status_code=500)
+    return _render("down.html", status=503, sid="", active="")
 
 
 if __name__ == "__main__":

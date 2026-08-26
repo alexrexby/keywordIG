@@ -3,7 +3,7 @@
 {% block body %}
 <h1>Очередь</h1>
 {% if not items %}
-<p>Ничего не ждёт отправки. Всё, что приходило, разобрано.</p>
+<p>Обращений пока не было: никто не писал кодовое слово, либо все записи уже вычищены по сроку хранения.</p>
 {% else %}
 <p class="hint">
   Последние обращения: сверху свежие. Здесь видно, на чём спотыкается отправка —
@@ -40,6 +40,25 @@
 </div>
 {% endfor %}
 {% endif %}
+{% if orphans %}
+<h2>Брони без карточки обращения</h2>
+<p class="hint">
+  Обращение вычищено по сроку хранения, а отметка «материал этому человеку уже выдавали»
+  осталась — иначе он получил бы материал второй раз. Если до него так и не дошло,
+  снимите бронь здесь: другого способа добраться до неё нет.
+</p>
+{% for hold in orphans %}
+<div class="item">
+  <p>{{ hold.igsid }}{% if hold.rule_name %} · правило «{{ hold.rule_name }}»{% endif %}</p>
+  <p class="meta">Отметка поставлена {{ hold.when }} · доставка #{{ hold.delivery_id }}</p>
+  <form method="post" action="/panel/queue/{{ hold.delivery_id }}/release">
+    <input type="hidden" name="_csrf" value="{{ csrf }}">
+    <button type="submit">Снять бронь</button>
+  </form>
+</div>
+{% endfor %}
+{% endif %}
+
 <p class="meta">
   {% if retention %}
   Карточки обращений удаляются через {{ retention }} суток — этот же срок стоит

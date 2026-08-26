@@ -134,6 +134,14 @@ async def purge_old_events() -> int:
         return cur.rowcount
 
 
+# Состояния, в которых доставка ЕЩЁ ПОЕДЕТ к человеку. Перечислены рабочие, а не
+# терминальные, намеренно: список терминальных растёт от этапа к этапу, и забытое в нём
+# состояние копилось бы вечно, тогда как забытое рабочее ломается громко.
+# Понятие одно на весь сервис — его читают и ретеншен, и признак «есть что снимать»
+# в очереди: если они разойдутся, панель предложит снять бронь у живой доставки.
+WORKING_STATES = ["PENDING", "CLAIMED", "REPLIED_PUBLIC", "SENT_DM"]
+
+
 async def purge_old_deliveries() -> int:
     """Ретеншен КАРТОЧЕК ОБРАЩЕНИЙ: старше DELIVERY_RETENTION_DAYS и уже не в работе.
 
@@ -149,10 +157,14 @@ async def purge_old_deliveries() -> int:
         данных в ней минимум: пара «правило + номер человека», ни текста, ни имени.
         Внешнего ключа на ig_delivery у неё нет (миграция 002), поэтому удаление карточки
         отметку не тронет и по каскаду;
-      • всё, что ЕЩЁ В РАБОТЕ (PENDING, CLAIMED, REPLIED_PUBLIC, SENT_DM): удалить такую
-        строку — потерять ответ человеку. Перечислены именно рабочие состояния, а не
-        терминальные: список терминальных растёт от этапа к этапу, и забытое в нём
-        состояние копилось бы вечно, тогда как забытое рабочее чинится громко.
+      • всё, что ЕЩЁ ПОЕДЕТ человеку (WORKING_STATES): удалить такую строку — потерять
+        ответ. С одной оговоркой, и она не косметическая: PENDING сам по себе не значит
+        «поедет». Пока токена нет или Meta его отвергла, круг диспетчера уходит на паузу
+        ДО claim_delivery, и единственная дорога к EXPIRED — через живой токен. В
+        брошенной установке (токен умирает раз в 60 суток) такие карточки с текстом
+        и именем человека лежали бы вечно, а /privacy обещает срок. Поэтому просроченное
+        окно платформы — тоже приговор: expires_at в прошлом означает, что этой доставке
+        не поехать уже никогда, чем бы дело ни кончилось.
     """
     if DELIVERY_RETENTION_DAYS <= 0:
         return 0
@@ -160,8 +172,8 @@ async def purge_old_deliveries() -> int:
         cur = await conn.execute(
             "DELETE FROM instagram.ig_delivery"
             " WHERE created_at < now() - make_interval(days => %s)"
-            "   AND state NOT IN ('PENDING', 'CLAIMED', 'REPLIED_PUBLIC', 'SENT_DM')",
-            (DELIVERY_RETENTION_DAYS,),
+            "   AND (NOT (state = ANY(%s)) OR expires_at < now() - interval '1 day')",
+            (DELIVERY_RETENTION_DAYS, WORKING_STATES),
         )
         return cur.rowcount
 
@@ -466,12 +478,22 @@ async def event_stats() -> dict:
     async with pool_ref().connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
-                "SELECT count(*) AS kept, max(received_at) AS last_at,"
-                "       pg_sequence_last_value('instagram.ig_event_id_seq') IS NOT NULL"
-                "         AS ever_received"
-                "  FROM instagram.ig_event"
+                "SELECT count(*) AS kept, max(received_at) AS last_at FROM instagram.ig_event"
             )
-            return await cur.fetchone()
+            row = await cur.fetchone()
+        try:
+            cur = await conn.execute(
+                "SELECT pg_sequence_last_value('instagram.ig_event_id_seq') IS NOT NULL"
+            )
+            row["ever_received"] = (await cur.fetchone())[0]
+        except psycopg.Error:
+            # Проба — НЕОБЯЗАТЕЛЬНОЕ поле, и уронить из-за неё весь ответ нельзя: этот же
+            # запрос кормит и панель, и doctor.sh, то есть всю диагностическую поверхность
+            # установки разом. Отдельным запросом и после счётчиков — чтобы её отказ не
+            # аварировал транзакцию до них.
+            log.warning("проба последовательности недоступна — считаю по строкам журнала")
+            row["ever_received"] = row["kept"] > 0 or row["last_at"] is not None
+        return row
 
 
 async def count_states_since(hours: int) -> dict[str, int]:
@@ -538,6 +560,36 @@ async def mark_token_invalid(reason: str) -> None:
             "   SET invalid_at = coalesce(invalid_at, now()), last_error = %s, updated_at = now()"
             " WHERE id = 1",
             (reason,),
+        )
+
+
+# ---------- Канал аварийных сообщений ----------
+# Состояние канала пережидает рестарт в базе, а не в памяти процесса: панель строит
+# на нём вердикт, и после каждого деплоя «канал не проверен ни разу» вытесняло бы
+# настоящие диагнозы. Миграция 006, там же почему таблица, а не две переменные.
+
+
+async def load_alert_state() -> dict | None:
+    """Когда сигнал доходил в последний раз и чем ответил мессенджер. None — строки нет."""
+    async with pool_ref().connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                "SELECT last_ok_at, last_error FROM instagram.ig_alert_channel WHERE id = 1"
+            )
+            return await cur.fetchone()
+
+
+async def save_alert_state(last_ok_at, last_error: str | None) -> None:
+    """Исход попытки доставки сигнала. Пишется ПОСЛЕ ответа мессенджера, вне транзакций
+    отправки: запись в базу не должна ни задерживать сигнал, ни отменять его."""
+    async with pool_ref().connection() as conn:
+        await conn.execute(
+            "INSERT INTO instagram.ig_alert_channel (id, last_ok_at, last_error)"
+            " VALUES (1, %s, %s)"
+            " ON CONFLICT (id) DO UPDATE SET last_ok_at = coalesce(EXCLUDED.last_ok_at,"
+            "   instagram.ig_alert_channel.last_ok_at),"
+            "   last_error = EXCLUDED.last_error, updated_at = now()",
+            (last_ok_at, last_error),
         )
 
 
@@ -771,6 +823,11 @@ async def admin_list_deliveries(limit: int) -> list[dict]:
     у кого можно снять бронь. LEFT JOIN по delivery_id, а не по паре (rule_id, igsid):
     интересует именно та отметка, которую поставила ЭТА доставка, — по паре нашлась бы
     и чужая, оставленная предыдущей.
+
+    Признак гасится у доставок, которые ЕЩЁ поедут (WORKING_STATES). Бронь ставится ПЕРЕД
+    отправкой, и после падения процесса свипер возвращает SENT_DM/CLAIMED обратно в PENDING
+    вместе с бронью: предложить снять её там значит пообещать «отправка не запустится»
+    и получить второе сообщение тому же человеку ближайшим кругом.
     """
     async with pool_ref().connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
@@ -779,11 +836,34 @@ async def admin_list_deliveries(limit: int) -> list[dict]:
                 "       d.source_text, d.rule_id, r.name AS rule_name, d.attempts,"
                 "       d.dm_attempts, d.dm_message_id, d.public_reply_id, d.last_error,"
                 "       d.run_after, d.expires_at, d.created_at, d.updated_at,"
-                "       (c.delivery_id IS NOT NULL) AS holds_contact"
+                "       (c.delivery_id IS NOT NULL"
+                "        AND NOT (d.state = ANY(%s))) AS holds_contact"
                 "  FROM instagram.ig_delivery d"
                 "  LEFT JOIN instagram.ig_rule r ON r.id = d.rule_id"
                 "  LEFT JOIN instagram.ig_contact_rule c ON c.delivery_id = d.id"
                 " ORDER BY d.id DESC LIMIT %s",
+                (WORKING_STATES, limit),
+            )
+            return await cur.fetchall()
+
+
+async def admin_orphan_holds(limit: int) -> list[dict]:
+    """Брони, чья карточка обращения уже вычищена ретеншеном.
+
+    Без этого списка такая бронь недостижима из панели НАВСЕГДА: кнопку рисует строка
+    очереди, а строки больше нет — и человек, до которого материал не дошёл год назад,
+    остаётся заперт от него без единого органа управления. Срок хранения карточек и есть
+    окно, в котором бронь ещё видно обычным способом.
+    """
+    async with pool_ref().connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                "SELECT c.rule_id, c.igsid, c.delivery_id, c.created_at, r.name AS rule_name"
+                "  FROM instagram.ig_contact_rule c"
+                "  LEFT JOIN instagram.ig_rule r ON r.id = c.rule_id"
+                " WHERE NOT EXISTS (SELECT 1 FROM instagram.ig_delivery d"
+                "                    WHERE d.id = c.delivery_id)"
+                " ORDER BY c.created_at DESC LIMIT %s",
                 (limit,),
             )
             return await cur.fetchall()

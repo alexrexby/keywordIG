@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+{% block title %}Панель недоступна{% endblock %}
+{% block body %}
+<div class="card warn">
+  <h1>Панель недоступна</h1>
+  <p>{{ reason }}</p>
+</div>
+<div class="buttons">
+  <a href="/panel/login"><button class="main" type="button">К форме входа</button></a>
+</div>
+{% endblock %}

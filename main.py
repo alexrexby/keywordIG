@@ -16,7 +16,7 @@ import time
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 from starlette.requests import ClientDisconnect
 
@@ -28,7 +28,7 @@ import logsafe
 import meta
 import panel
 import tokens
-from config import IG_APP_SECRET, IG_VERIFY_TOKEN
+from config import HEALTH_STALE_SEC, IG_APP_SECRET, IG_VERIFY_TOKEN
 from signature import verify_signature, verify_token
 
 logging.basicConfig(level=logging.INFO)
@@ -46,9 +46,6 @@ MAX_BODY_BYTES = 256 * 1024
 MAX_EVENTS_PER_REQUEST = 200
 # event_key входит в btree-индекс (предел строки ~2704 байта) — длинный id заменяем хешем.
 MAX_EVENT_KEY_LEN = 200
-# Сколько секунд без круга диспетчера считаем смертью цикла. Круг идёт раз в 5 с даже
-# на простое, так что две минуты — это уже не «занят», а «не работает».
-HEALTH_STALE_SEC = 120
 # Окно дожатия на остановке. Худший случай доставки больше окна (два throttle плюс два
 # POST по 20 с = 46 с), и это осознанно: окно закрывает публичный ответ и начало директа,
 # а срезка на самом директе безопасна — второй private reply на тот же комментарий
@@ -174,6 +171,12 @@ app.include_router(panel.router)
 # приложения, а без публикации не приходят вебхуки. Отдаёт их сервис, чтобы адрес
 # не зависел от чужого хостинга и не протухал отдельно от установки.
 app.include_router(legal.router)
+# Отказы панели — человеческой страницей, а не JSON'ом и не голым «Internal Server Error»:
+# упавшая база — самый частый отказ установки, и панель существует ровно ради таких минут.
+# Обработчики живут в panel.py и на путях вне /panel/* ведут себя как раньше; убрать их
+# вместе с панелью — это те же две строки.
+app.add_exception_handler(HTTPException, panel.on_http_error)
+app.add_exception_handler(Exception, panel.on_error)
 
 
 async def retention_loop():

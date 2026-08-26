@@ -265,7 +265,13 @@ async def refresh_if_needed() -> bool:
         ig_user_id=IG_USER_ID,
         token_enc=encrypt(value),
         expires_at=_now() + lifetime,
-        refreshed_at=_now(),
+        # refreshed_at — это «Meta НАЗВАЛА срок», а не «мы сходили в Meta». Ставя его
+        # безусловно, мы выдавали горизонт зонда за подтверждённый срок, и панель рисовала
+        # обратный отсчёт по выдуманному числу — ровно та ложь, ради которой признак и
+        # заведён (см. TokenState.refreshed_at). Пустой expires_in оставляет отметку
+        # пустой, и REFRESH_SILENCE_LIMIT начинает считать молчание Meta о сроке — это
+        # и есть поведение, описанное в шапке модуля.
+        refreshed_at=_now() if expires_in else None,
     )
     forget()
     log.info(

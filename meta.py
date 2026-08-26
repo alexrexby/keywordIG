@@ -19,6 +19,7 @@ from typing import Any
 
 import httpx
 
+import db
 import logsafe
 from rules import MAX_MESSAGE_BYTES, clip
 from config import (
@@ -234,6 +235,12 @@ MAX_ALERT_CHARS = 4000
 # написать ERROR в лог, а логи установщика никто не читает. Поэтому наружу отдаётся
 # ВРЕМЯ последней успешной доставки (/ig/admin/state, панель, doctor.sh): «никогда» —
 # это отдельный вердикт «канал не проверен», а не ноль в счётчике.
+#
+# Эти две переменные — КЭШ на случай, когда база недоступна; источник правды с миграции
+# 006 лежит в instagram.ig_alert_channel. Память процесса тут не годится по существу:
+# рестарт (деплой, перезагрузка хоста, SIGTERM сторожка) обнулял бы вердикт в «канал не
+# проверен ни разу», и это ложное «warn» вытесняло бы настоящие «down» — то есть панель
+# врала бы ровно в той строке, ради которой её открывают.
 last_alert_ok_at: datetime | None = None
 last_alert_error: str | None = None
 
@@ -243,13 +250,35 @@ def channel_configured() -> bool:
     return bool(IG_ALERT_BOT_TOKEN) and IG_ALERT_CHAT_ID.lstrip("-").isdigit()
 
 
-def channel_state() -> dict:
-    """Что показать человеку про канал алертов. Секретов здесь нет и быть не должно."""
+async def channel_state() -> dict:
+    """Что показать человеку про канал алертов. Секретов здесь нет и быть не должно.
+
+    Читается из базы, а не из памяти: см. комментарий у last_alert_ok_at. База недоступна —
+    отвечаем тем, что помним с этого запуска; врать «не проверен» из-за упавшей базы
+    нельзя, это отправит человека чинить исправный канал.
+    """
+    stored = None
+    try:
+        stored = await db.load_alert_state()
+    except Exception:
+        log.warning("состояние канала алертов не прочиталось из базы, отвечаю по памяти")
+    if stored is None:
+        stored = {"last_ok_at": last_alert_ok_at, "last_error": last_alert_error}
     return {
         "configured": channel_configured(),
-        "last_ok_at": last_alert_ok_at.isoformat() if last_alert_ok_at else None,
-        "last_error": last_alert_error,
+        "last_ok_at": stored["last_ok_at"].isoformat() if stored["last_ok_at"] else None,
+        "last_error": stored["last_error"],
     }
+
+
+async def _remember(ok_at: datetime | None, error: str | None) -> None:
+    """Исход попытки — в базу, чтобы пережил рестарт. Отказ записи не отменяет алерт:
+    сигнал уже отправлен (или уже не отправлен), и падать здесь значило бы уронить
+    сообщение об аварии из-за второй аварии."""
+    try:
+        await db.save_alert_state(ok_at, error)
+    except Exception:
+        log.warning("состояние канала алертов не записалось в базу")
 
 
 async def alert_owner(text: str) -> bool:
@@ -268,6 +297,7 @@ async def alert_owner(text: str) -> bool:
     if not channel_configured():
         last_alert_error = "канал не настроен: пусты IG_ALERT_BOT_TOKEN или IG_ALERT_CHAT_ID"
         log.error("алерт отправить некому — %s", last_alert_error)
+        await _remember(None, last_alert_error)
         return False
     try:
         resp = await client().post(
@@ -282,15 +312,18 @@ async def alert_owner(text: str) -> bool:
     except Exception as exc:
         last_alert_error = f"до Telegram не достучались: {type(exc).__name__}"
         log.error("алерт не доставлен — %s", last_alert_error)
+        await _remember(None, last_alert_error)
         return False
     if resp.is_error or not _accepted(resp):
         # Описание отказа от Telegram («chat not found», «bot was blocked by the user»)
         # — это ровно то, что установщику нужно прочитать; токена в нём нет.
         last_alert_error = f"Telegram ответил {resp.status_code}: {_description(resp)}"
         log.error("алерт не доставлен — %s", last_alert_error)
+        await _remember(None, last_alert_error)
         return False
     last_alert_ok_at = datetime.now(timezone.utc)
     last_alert_error = None
+    await _remember(last_alert_ok_at, None)
     return True
 
 
