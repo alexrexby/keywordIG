@@ -1,0 +1,568 @@
+#!/bin/bash
+# Установка одной командой: проверка среды -> секреты -> подъём -> проба канала аварийных
+# сообщений -> карточка с тем, что нести в дашборд Meta.
+#
+# Файл написан для человека, который видит этот код впервые и которому некому позвонить.
+# Отсюда два правила, которым подчинено всё остальное:
+#   1. Отказ обязан называть, ЧТО СДЕЛАТЬ. «Заведите A-запись на этот адрес» вместо
+#      падения прокси через две минуты: то падение читается как «пакет сломан», хотя
+#      сломана одна строчка у регистратора домена.
+#   2. Существующий файл окружения не переписывается НИКОГДА. Повторный запуск — обычное
+#      дело (не разошёлся DNS, не выдался сертификат, оборвалась сеть), и он не должен
+#      стоить установке её секретов: потерянный ключ конверта — это потерянный токен,
+#      потерянный пароль базы — база, в которую больше не войти.
+#
+# Проверить установку потом: ./scripts/doctor.sh
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+
+COMPOSE="docker compose -f docker-compose.prod.yml"
+ENV_PATH="$ROOT/.env"
+# Сертификат обычно выдаётся за десяток секунд. Три минуты — это запас на медленный DNS
+# у регистратора, после которого ждать уже нечего: причина всегда одна из двух названных.
+TLS_WAIT_SEC=180
+PASSWORD_MIN=8
+
+DOMAIN="${1:-}"
+
+say() { printf '%s\n' "$*"; }
+step() { printf '\n== %s ==\n' "$*"; }
+warn() { printf '\n!! %s\n' "$*"; }
+die() {
+	printf '\n!! %s\n' "$*" >&2
+	exit 1
+}
+
+usage() {
+	cat >&2 <<'TXT'
+Установка автоответчика на комментарии в Instagram.
+
+  ./scripts/install.sh ваш-домен.ru
+
+Домен пишется без https:// и без слэша. A-запись на него должна указывать на эту машину
+ДО запуска: без неё не выдадут сертификат, и выглядеть это будет как «ничего не работает».
+
+Что понадобится под рукой (всё берётся в дашборде Meta, порядок — в docs/INSTALL.md):
+  • App Secret приложения — Settings -> Basic
+  • токен бота Telegram и ваш chat_id: это канал аварийных сообщений. Без него об
+    остановке автоответов вы узнаете от подписчиков, а не от сервиса.
+  • реквизиты для публичной политики конфиденциальности: имя, аккаунт, кто отвечает
+    за данные, почта для обращений. Без них страница политики не покажется, а без
+    политики Meta не даст опубликовать приложение.
+TXT
+	exit 1
+}
+
+# ---------- Вопросы ----------
+# Значения спрашиваются, а не берутся из окружения: окружение установщика попадает
+# в историю шелла и в `ps aux`, а ответ на вопрос — нет.
+
+ask_value() {
+	# ask_value <имя переменной> <вопрос> <yes|no обязательность>
+	local target="$1" prompt="$2" required="$3" value=""
+	while :; do
+		if ! read -r -p "$prompt" value; then
+			if [ "$required" = "yes" ]; then
+				die "ответ не получен. Установка задаёт вопросы — запускайте её в терминале."
+			fi
+			value=""
+			break
+		fi
+		if [ -z "$value" ] && [ "$required" = "yes" ]; then
+			say "   без этого значения установка не поднимется — введите его"
+			continue
+		fi
+		# Знак доллара docker compose принимает за имя переменной и молча съедает часть
+		# строки; кавычка рвёт файл окружения. Оба отказа выглядят потом как «неверный
+		# пароль» или «панель закрыта», и связать их с введённым символом невозможно.
+		case "$value" in
+		*'$'* | *'"'*)
+			say "   уберите из значения \$ и \" — файл окружения их не переживает"
+			continue
+			;;
+		esac
+		break
+	done
+	printf -v "$target" '%s' "$value"
+}
+
+ask_secret() {
+	# То же, но без эха: значение видно через плечо и остаётся в буфере терминала.
+	local target="$1" prompt="$2" required="$3" value=""
+	while :; do
+		if ! read -r -s -p "$prompt" value; then
+			printf '\n'
+			if [ "$required" = "yes" ]; then
+				die "ответ не получен. Установка задаёт вопросы — запускайте её в терминале."
+			fi
+			value=""
+			break
+		fi
+		printf '\n'
+		if [ -z "$value" ] && [ "$required" = "yes" ]; then
+			say "   без этого значения установка не поднимется — введите его"
+			continue
+		fi
+		case "$value" in
+		*'$'* | *'"'*)
+			say "   уберите из значения \$ и \" — файл окружения их не переживает"
+			continue
+			;;
+		esac
+		break
+	done
+	printf -v "$target" '%s' "$value"
+}
+
+ask_yes() {
+	# Ответ сверяется ЦЕЛИКОМ, а не первой буквой: в системной локали C кириллица — это
+	# два байта, и «нет» с «да» неотличимы для шаблона вида [дД]*. Такой промах прочитал
+	# бы отказ как согласие ровно там, где человека спрашивают, дошло ли сообщение.
+	local answer=""
+	read -r -p "$1 [да/нет] " answer || return 1
+	case "$answer" in
+	д | да | Д | Да | ДА | y | Y | yes | YES | Yes) return 0 ;;
+	esac
+	return 1
+}
+
+# ---------- Наблюдения о среде ----------
+
+oneline() {
+	# Список адресов в одну строку, без хвостового пробела: сообщение читает человек,
+	# и «указывает на 1.2.3.4 , а адреса машины — 5.6.7.8 .» выглядит как опечатка пакета.
+	tr '\n' ' ' | sed -e 's/  */ /g' -e 's/ *$//'
+}
+
+resolve_a() {
+	if command -v dig >/dev/null 2>&1; then
+		dig +short A "$1" 2>/dev/null | grep -E '^[0-9]+(\.[0-9]+){3}$' || true
+	else
+		# dig есть не на всякой свежей машине, getent есть везде. Он ходит через системный
+		# резолвер, то есть видит и /etc/hosts — для установки этого достаточно, а doctor.sh
+		# про эту слепоту говорит отдельной строкой.
+		getent ahostsv4 "$1" 2>/dev/null | awk '{print $1}' | sort -u || true
+	fi
+}
+
+machine_ips() {
+	# Каждый источник адресов заканчивается `|| true`, и это не перестраховка: `hostname -I`
+	# есть не во всякой системе (в busybox его нет), а при включённом pipefail один такой
+	# отказ обрывает установку БЕЗ ЕДИНОГО СЛОВА — то самое молчаливое падение, ради
+	# замены которого этот preflight и написан.
+	{
+		ip -4 -o addr show scope global 2>/dev/null | awk '{split($4, a, "/"); print a[1]}' || true
+		hostname -I 2>/dev/null | tr ' ' '\n' || true
+	} | grep -E '^[0-9]+(\.[0-9]+){3}$' | sort -u || true
+}
+
+port_listener() {
+	# 0 — порт кто-то слушает. Нечем проверить — считаем, что свободен, и говорим об этом.
+	if command -v ss >/dev/null 2>&1; then
+		ss -Hltn "sport = :$1" 2>/dev/null | grep -q .
+	elif command -v lsof >/dev/null 2>&1; then
+		lsof -iTCP:"$1" -sTCP:LISTEN -n -P >/dev/null 2>&1
+	else
+		return 1
+	fi
+}
+
+our_caddy_running() {
+	# Имя контейнера собрано из `name: keywordig` в docker-compose.prod.yml.
+	docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^keywordig-caddy-1$'
+}
+
+env_value() {
+	sed -n "s/^$1=//p" "$ENV_PATH" | tail -1 | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//"
+}
+
+# ---------- 1. Проверка среды ----------
+
+preflight() {
+	[ -n "$DOMAIN" ] || usage
+	step "1/6 проверка среды"
+
+	case "$DOMAIN" in
+	*://* | */*) die "домен пишется без схемы и без слэша: example.ru, а не https://example.ru/" ;;
+	*.*) ;;
+	*) die "«$DOMAIN» не похож на домен. Нужно доменное имя, на которое вы можете завести A-запись." ;;
+	esac
+
+	command -v docker >/dev/null 2>&1 ||
+		die "Docker не установлен. Инструкция для вашей системы: https://docs.docker.com/engine/install/"
+	docker compose version >/dev/null 2>&1 ||
+		die "нужен плагин «docker compose» версии 2. Старый docker-compose 1.x этот файл не соберёт."
+	docker info >/dev/null 2>&1 ||
+		die "демон Docker не отвечает: sudo systemctl start docker. Если вы не root — добавьте себя в группу docker и перезайдите в систему."
+	command -v openssl >/dev/null 2>&1 ||
+		die "нет openssl, им генерируются пароли базы: sudo apt-get install -y openssl"
+	command -v python3 >/dev/null 2>&1 ||
+		die "нет python3, им генерируются ключи сервиса: sudo apt-get install -y python3"
+	command -v curl >/dev/null 2>&1 ||
+		die "нет curl, им проверяется выдача сертификата: sudo apt-get install -y curl"
+	say "docker, docker compose, openssl, python3, curl — на месте"
+
+	# Домен из уже существующего файла окружения важнее аргумента: молча поднять установку
+	# на другом домене значит выдать сертификат не на тот адрес и увести вебхуки в никуда.
+	if [ -f "$ENV_PATH" ]; then
+		local recorded
+		recorded="$(env_value IG_DOMAIN)"
+		if [ -n "$recorded" ] && [ "$recorded" != "$DOMAIN" ]; then
+			die "$(printf 'в файле окружения записан домен %s, а установка запущена для %s.\n   Запустите её для %s — или, если домен меняется осознанно, впишите новый в файл\n   окружения руками и выполните ./scripts/update.sh.' "$recorded" "$DOMAIN" "$recorded")"
+		fi
+	fi
+
+	local port
+	for port in 80 443; do
+		if port_listener "$port"; then
+			if our_caddy_running; then
+				say "порт $port занят прокси этой же установки — это повторный запуск, продолжаю"
+			else
+				die "$(printf 'порт %s занят посторонней программой (обычно это nginx или apache).\n   Посмотреть кем: sudo ss -ltnp '"'"'sport = :%s'"'"'\n   Прокси установки слушает 80 и 443 сам, делить их не с кем.' "$port" "$port")"
+			fi
+		fi
+	done
+
+	local resolved ips
+	resolved="$(resolve_a "$DOMAIN")"
+	ips="$(machine_ips)"
+	if [ -z "$resolved" ]; then
+		die "$(printf 'A-записи на %s нет — домен никуда не указывает.\n   Заведите её у регистратора домена: A %s -> %s\n   Без A-записи сертификат не выдадут, и это будет выглядеть как «сервис не работает».\n   Записи расходятся по интернету от минут до нескольких часов; после этого запустите\n   установку снова — она ничего не потеряет.' "$DOMAIN" "$DOMAIN" "$(echo "$ips" | head -1)")"
+	fi
+	if [ -n "$ips" ] && ! comm -12 <(echo "$resolved" | sort -u) <(echo "$ips") | grep -q .; then
+		warn "$(printf 'домен указывает на %s, а адреса этой машины — %s.' "$(echo "$resolved" | oneline)" "$(echo "$ips" | oneline)")"
+		say "   Это нормально, если перед сервером стоит CDN или прокси (например Cloudflare)."
+		say "   Это ошибка, если A-запись осталась от старого сервера: тогда сертификат не выдадут."
+		ask_yes "   Продолжать установку?" || die "остановился по вашему ответу. Поправьте A-запись и запустите снова."
+	else
+		say "домен $DOMAIN указывает на эту машину"
+	fi
+
+	if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
+		ufw status 2>/dev/null | grep -qE '(^|[[:space:]])(80|443)(/|[[:space:]]|$)' ||
+			warn "файрвол ufw включён, и правил на 80/443 в нём не видно: sudo ufw allow 80,443/tcp"
+	fi
+
+	# Честно: доступность порта 80 ИЗ ИНТЕРНЕТА с этой же машины не проверяется никак —
+	# на запрос к самому себе она ответит и в полностью закрытой сети. Единственная
+	# настоящая проверка — выдача сертификата на шаге 5, и если он не выдастся, первых
+	# причин ровно две: до порта 80 не пускает файрвол (хостера или системный) либо
+	# A-запись указывает не сюда.
+	say "порт 80 снаружи отсюда не проверить — правду скажет выдача сертификата на шаге 5"
+}
+
+# ---------- 2. Секреты ----------
+
+generate_env() {
+	step "2/6 секреты установки"
+
+	if [ -f "$ENV_PATH" ]; then
+		say "файл окружения уже есть — не трогаю его, вопросов не задаю (шаг 3 пропущен)."
+		say "В нём живые секреты этой установки: перезаписать их значит потерять доступ"
+		say "к базе и к сохранённому токену. Менять значения — руками, потом ./scripts/update.sh."
+		return
+	fi
+
+	say "Файла окружения нет — значит установка новая. Сейчас несколько вопросов."
+	say "Секреты сервиса я сгенерирую сам: придуманный пароль со знаком @ или / рвёт"
+	say "строку подключения к базе, а отказ выглядит потом как «неверный пароль»."
+	say ""
+
+	local app_secret user_id access_token
+	ask_secret app_secret "App Secret приложения Meta (Settings -> Basic): " yes
+	say "Идентификатор вашего аккаунта Instagram — тот, что виден в поле entry.id вебхука."
+	say "Не знаете его сейчас — оставьте пустым, впишете позже."
+	ask_value user_id "  IG_USER_ID (можно пустым): " no
+	say "Токен доступа нужен только для первого засева, дальше сервис продлевает его сам."
+	say "Его выдают последним шагом, когда сервис уже работает, — пустой ответ здесь норма:"
+	say "токен вставляется потом в панели, без правки файлов."
+	ask_secret access_token "  токен доступа (можно пустым): " no
+
+	local bot_token chat_id
+	say ""
+	say "Канал аварийных сообщений. Все отказы этой механики молчаливые: отсутствие ответа"
+	say "в директе никто не наблюдает. Без канала о поломке вы узнаете от подписчиков."
+	ask_secret bot_token "  токен бота Telegram от @BotFather (можно пустым): " no
+	ask_value chat_id "  ваш chat_id, его покажет @userinfobot (можно пустым): " no
+
+	local service_name account legal_name contact_email tax_id address updated
+	say ""
+	say "Реквизиты публичной политики конфиденциальности. Её адрес вы понесёте в дашборд"
+	say "Meta: без него приложение не опубликовать, а без публикации не приходят вебхуки."
+	say "Незаполненное поле — это 503 вместо страницы, а не страница с пустотами."
+	ask_value service_name "  как называется то, что стоит на домене («Автоответы @имя»): " yes
+	ask_value account "  аккаунт в Instagram, вместе с собакой: " yes
+	ask_value legal_name "  кто отвечает за данные («ИП Иванов Иван Иванович»): " yes
+	ask_value contact_email "  почта для обращений, её читает живой человек: " yes
+	ask_value tax_id "  ИНН или местный аналог (можно пустым): " no
+	ask_value address "  почтовый адрес (можно пустым — страница напишет «дадим по запросу»): " no
+	ask_value updated "  дата редакции документа (пусто — поставлю сегодняшнюю): " no
+	[ -n "$updated" ] || updated="$(date +%d.%m.%Y)"
+
+	local panel_password confirm
+	say ""
+	say "Пароль от панели установки: из неё чинят аварии, в том числе с телефона."
+	while :; do
+		ask_secret panel_password "  пароль панели (не короче $PASSWORD_MIN символов): " yes
+		ask_secret confirm "  повторите пароль: " yes
+		[ "${#panel_password}" -ge "$PASSWORD_MIN" ] || {
+			say "   слишком короткий: панель открыта в интернет, её подбирают роботами"
+			continue
+		}
+		[ "$panel_password" = "$confirm" ] || {
+			say "   пароли не совпали"
+			continue
+		}
+		break
+	done
+
+	# Образ собирается ДО записи файла окружения, потому что хеш пароля панели считает
+	# тот же код, который потом этот пароль проверяет. Второй реализации формата хеша
+	# не заводим: разъехавшись, она закроет панель, и причина будет не видна ниоткуда.
+	step "3/6 сборка образа"
+	local image
+	image="$(docker build -q "$ROOT")" || die "образ не собрался, смотрите вывод выше"
+	say "образ собран: $image"
+
+	local password_hash
+	# Пароль уходит по конвейеру, а не аргументом: argv виден в `ps aux` любому
+	# пользователю хоста. printf — встроенная команда шелла, отдельного процесса нет.
+	# `|| true` обязателен: при включённом pipefail отказ любого звена оборвал бы
+	# установку молча, а разбираться с молчанием некому — вердикт выносит проверка ниже.
+	password_hash="$(printf '%s\n' "$panel_password" | docker run --rm -i "$image" python panel.py | tail -1 | tr -d '\r' || true)"
+	case "$password_hash" in
+	scrypt:*) ;;
+	*) die "хеш пароля панели не посчитался (получено: «$password_hash»). Смотрите вывод выше: это ошибка пакета, а не ваша." ;;
+	esac
+	case "$password_hash" in
+	*'$'*) die "в хеше пароля оказался знак доллара — docker compose съест часть строки, и панель закроется. Это ошибка пакета, а не ваша." ;;
+	esac
+
+	# Генерация секретов. У каждой строки свой инструмент, и это не вкусовщина:
+	#   hex — попадает в строку подключения postgresql://ig_service:<пароль>@postgres/ig,
+	#         где любой из символов @ : / # % ? рвёт разбор адреса;
+	#   token_urlsafe — переживает URL-кодирование в query-строке проверки Meta,
+	#         копипасту в дашборд и значение HTTP-заголовка (ASCII без пробелов).
+	# Знака доллара нет ни в одном из двух алфавитов — см. случай с хешем выше.
+	local db_password db_superuser verify_token admin_token token_key admin_secret
+	db_password="$(openssl rand -hex 32)"
+	db_superuser="$(openssl rand -hex 32)"
+	verify_token="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+	admin_token="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+	token_key="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+	admin_secret="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+
+	# Файл пишется целиком и один раз: наполовину записанное окружение пережило бы обрыв
+	# и на следующем запуске выглядело бы как готовая установка. Черновик лежит рядом,
+	# в том же каталоге (иначе переименование перестаёт быть одним действием), и убирается
+	# на любом выходе — включая обрыв на середине.
+	local tmp
+	tmp="$(mktemp "$ROOT/.env-draft.XXXXXX")"
+	# shellcheck disable=SC2064
+	trap "rm -f '$tmp'" EXIT
+	chmod 600 "$tmp"
+	{
+		echo "# Секреты этой установки. Создан установщиком $(date +%F), правится руками."
+		echo "# Пояснение к каждому полю — в .env.example рядом. После правки: ./scripts/update.sh"
+		echo ""
+		echo "IG_DOMAIN=$DOMAIN"
+		echo ""
+		echo "# Пароль роли сервиса и пароль суперюзера базы. Разные намеренно: кто прочитал"
+		echo "# строку подключения сервиса, тот не становится суперюзером."
+		echo "IG_DB_PASSWORD=$db_password"
+		echo "IG_DB_SUPERUSER_PASSWORD=$db_superuser"
+		echo ""
+		echo "# Приложение Meta."
+		echo "IG_APP_SECRET=$app_secret"
+		echo "IG_VERIFY_TOKEN=$verify_token"
+		echo "IG_USER_ID=$user_id"
+		echo "IG_ACCESS_TOKEN=$access_token"
+		echo "IG_GRAPH_VERSION=v25.0"
+		echo ""
+		echo "# Ключи сервиса. Ключ конверта потерять нельзя: им расшифровывается токен."
+		echo "IG_TOKEN_KEY=$token_key"
+		echo "IG_ADMIN_TOKEN=$admin_token"
+		echo ""
+		echo "# Канал аварийных сообщений."
+		echo "IG_ALERT_BOT_TOKEN=$bot_token"
+		echo "IG_ALERT_CHAT_ID=$chat_id"
+		echo ""
+		echo "# Предохранители отправки: сообщений в минуту и в сутки. Рискует ваш аккаунт."
+		echo "IG_DISPATCH_RATE=20"
+		echo "IG_DAILY_DM_LIMIT=50"
+		echo ""
+		echo "# Панель установки: https://$DOMAIN/panel"
+		echo "IG_ADMIN_SECRET=$admin_secret"
+		echo "IG_ADMIN_PASSWORD_HASH=$password_hash"
+		echo ""
+		echo "# Срок хранения карточек обращений. Это же число печатает публичная политика."
+		echo "IG_DELIVERY_RETENTION_DAYS=365"
+		echo ""
+		echo "# Реквизиты публичных страниц /privacy и /data-deletion."
+		echo "OWNER_SERVICE_NAME=\"$service_name\""
+		echo "OWNER_ACCOUNT=\"$account\""
+		echo "OWNER_LEGAL_NAME=\"$legal_name\""
+		echo "OWNER_CONTACT_EMAIL=\"$contact_email\""
+		echo "OWNER_TAX_ID=\"$tax_id\""
+		echo "OWNER_ADDRESS=\"$address\""
+		echo "OWNER_POLICY_UPDATED=\"$updated\""
+	} >"$tmp"
+
+	if [ -f "$ENV_PATH" ]; then
+		die "файл окружения появился во время установки — не перезаписываю его"
+	fi
+	mv "$tmp" "$ENV_PATH"
+	say "файл окружения создан, права 600. В git он не попадёт: он в списке игнорируемых."
+}
+
+# ---------- 4. Подъём ----------
+
+bring_up() {
+	step "4/6 подъём"
+	# Миграции применяет сам сервис на старте: провалившаяся миграция не даст контейнеру
+	# стать здоровым, и `--wait` вернёт ошибку — то есть отдельной проверки не нужно.
+	if ! $COMPOSE up -d --build --wait; then
+		warn "состав не поднялся. Последние строки журналов — ниже."
+		$COMPOSE ps || true
+		$COMPOSE logs --tail=30 instagram-service || true
+		$COMPOSE logs --tail=15 postgres || true
+		die "разберитесь по журналам выше и запустите установку снова: секреты уже записаны и не потеряются"
+	fi
+	say "прокси, база и сервис отвечают на проверки здоровья"
+
+	step "5/6 сертификат"
+	say "Жду, пока прокси получит сертификат на $DOMAIN (обычно секунды)."
+	local waited=0 code=000
+	while [ "$waited" -lt "$TLS_WAIT_SEC" ]; do
+		# Без `|| echo 000`: curl печатает свой «000» сам, и запасное значение приклеилось
+		# бы к нему второй раз — в сообщении об отказе появлялось «000000», по которому
+		# человек не найдёт ничего.
+		code="$(curl -sS --max-time 5 -o /dev/null -w '%{http_code}' "https://$DOMAIN/ig/health" 2>/dev/null)" || true
+		[ -n "$code" ] || code=000
+		[ "$code" = "200" ] && break
+		sleep 5
+		waited=$((waited + 5))
+	done
+	if [ "$code" != "200" ]; then
+		warn "сертификат на $DOMAIN не получен за $TLS_WAIT_SEC секунд (последний ответ: $code)."
+		say "Причин ровно две, и обе не в пакете:"
+		say "  1) до порта 80 этой машины не пускают из интернета — файрвол хостера или системный;"
+		say "  2) A-запись домена указывает не на эту машину."
+		say "Что говорит сам прокси:"
+		$COMPOSE logs --tail=15 caddy || true
+		die "починИ́те одно из двух и запустите установку снова — она ничего не потеряет"
+	fi
+	say "https://$DOMAIN отвечает, сертификат выдан"
+}
+
+# ---------- 6. Проба канала аварийных сообщений ----------
+
+test_alert() {
+	step "6/6 проба канала аварийных сообщений"
+
+	if [ -z "$(env_value IG_ALERT_BOT_TOKEN)" ] || [ -z "$(env_value IG_ALERT_CHAT_ID)" ]; then
+		warn "канал аварийных сообщений не настроен."
+		say "Это единственный способ узнать, что автоответы остановились: сервис молчит так же,"
+		say "как работает. Впишите IG_ALERT_BOT_TOKEN и IG_ALERT_CHAT_ID в файл окружения"
+		say "и выполните ./scripts/update.sh."
+		return
+	fi
+
+	local attempt=1 result
+	while :; do
+		# Сообщение шлёт сам сервис, тем же кодом, которым будет слать аварии, и внутри
+		# контейнера: секретам незачем появляться в окружении этого скрипта.
+		result="$($COMPOSE exec -T instagram-service python - <<'PY' 2>/dev/null || true
+import asyncio
+
+import db
+import meta
+
+
+async def main():
+    # Свой пул: этот процесс живёт вне lifespan, а отметку об успешной доставке нужно
+    # положить в базу — её потом читают панель и doctor.sh.
+    db.pool = db.make_pool()
+    await db.pool.open()
+    try:
+        ok = await meta.send_test_alert()
+    finally:
+        await meta.close()
+        await db.pool.close()
+    print("SENT" if ok else "FAILED: " + (meta.last_alert_error or "причина не названа"))
+
+
+asyncio.run(main())
+PY
+		)"
+		case "$result" in
+		SENT*) say "Telegram принял сообщение. Загляните в мессенджер." ;;
+		FAILED*) say "Telegram сообщение не принял. $result" ;;
+		*) say "проба не выполнилась (сервис не ответил). Проверьте: $COMPOSE logs --tail=20 instagram-service" ;;
+		esac
+
+		# «Функция не упала» и «сообщение дошло» — разные утверждения. Первое видит машина,
+		# второе — только человек, который смотрит в мессенджер.
+		if ask_yes "Сообщение пришло вам в мессенджер?"; then
+			say "канал проверен: об остановке автоответов вам будет кому сказать"
+			return
+		fi
+		attempt=$((attempt + 1))
+		if [ "$attempt" -gt 3 ]; then
+			warn "канал так и не подтверждён — установка на этом не останавливается, но вы остаётесь без сигнализации."
+			say "Что обычно не так: не тот chat_id (у групп он с минусом); боту не написали"
+			say "первым — тогда он не имеет права писать вам; токен скопирован не целиком."
+			say "Поправьте значения в файле окружения и выполните ./scripts/doctor.sh --alert-test"
+			return
+		fi
+		say ""
+		say "Проверьте в файле окружения: IG_ALERT_CHAT_ID — только цифры (у групп с минусом),"
+		say "IG_ALERT_BOT_TOKEN — целиком, вида 123456789:AA... И напишите боту в Telegram"
+		say "любое сообщение: боту нельзя писать первым тому, кто ему не писал."
+		ask_yes "Поправили? Повторить пробу?" || {
+			warn "канал остался непроверенным"
+			return
+		}
+		$COMPOSE up -d --wait instagram-service >/dev/null 2>&1 || true
+	done
+}
+
+# ---------- Карточка для дашборда ----------
+
+print_card() {
+	local verify_token
+	verify_token="$(env_value IG_VERIFY_TOKEN)"
+	cat <<TXT
+
+===============================================================================
+Установка работает. Дальше — то, что нужно перенести в дашборд Meta руками.
+
+  Callback URL          https://$DOMAIN/ig/webhook
+  Verify token          $verify_token
+  Privacy Policy URL    https://$DOMAIN/privacy
+  User data deletion    https://$DOMAIN/data-deletion
+
+  Панель установки      https://$DOMAIN/panel   (пароль — тот, что вы задали)
+
+Осталось семь шагов, которые может сделать только человек с доступом к аккаунту:
+перевести аккаунт в профессиональный, создать приложение, заполнить политику и
+категорию, добавить аккаунт в роли и ПРИНЯТЬ приглашение, настроить вебхуки,
+подписаться на comments и messages и ОПУБЛИКОВАТЬ приложение.
+
+Каждый шаг с проверкой «что должно получиться» — в docs/INSTALL.md.
+
+Самое дорогое место: пока приложение не опубликовано, вебхуки не приходят ВООБЩЕ
+и без единой ошибки. Всё выглядит настроенным, а событий нет.
+
+Проверить установку целиком: ./scripts/doctor.sh
+===============================================================================
+TXT
+}
+
+preflight
+generate_env
+bring_up
+test_alert
+print_card
