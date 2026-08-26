@@ -2,7 +2,7 @@ fastapi>=0.115
 uvicorn>=0.30
 psycopg[binary,pool]>=3.2
 python-dotenv>=1.0
-# Этап 2: исходящие вызовы Graph API (та же зависимость, что в apps/telegram-service)
+# Исходящие вызовы: Graph API Instagram и Telegram Bot API для аварийных сигналов
 httpx>=0.27
-# Конверт AES-256-GCM для токена — тот же формат, что у секретов настроек в CRM
+# Конверт AES-256-GCM для токена доступа: в базе он лежит зашифрованным
 cryptography>=43

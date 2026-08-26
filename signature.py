@@ -23,7 +23,7 @@ def verify_signature(raw_body: bytes, header: str | None, app_secret: str) -> bo
 
     Тело обязано быть теми же байтами, что пришли по сети: пересериализованный
     JSON даёт другую подпись. Пустой секрет закрывает роут целиком (fail-closed),
-    как пустой INTERNAL_TOKEN в приёмнике вебхуков CRM.
+    как пустой verify token закрывает handshake.
     """
     if not app_secret or not header or not header.startswith(PREFIX):
         return False

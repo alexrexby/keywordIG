@@ -78,8 +78,8 @@ CREATE TABLE instagram.ig_delivery (
   expires_at      timestamptz NOT NULL,
   public_reply_id text,
   dm_message_id   text,
-  crm_lead_id     text,                      -- этап 3
-  crm_synced_at   timestamptz,               -- этап 3
+  crm_lead_id     text,                      -- не используется: своей CRM у пакета нет
+  crm_synced_at   timestamptz,               -- не используется
   created_at      timestamptz NOT NULL DEFAULT now(),
   updated_at      timestamptz NOT NULL DEFAULT now(),
   UNIQUE (source, source_id)

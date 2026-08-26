@@ -1,17 +1,20 @@
-"""Исходящий HTTP сервиса: Graph API Instagram и аварийный сигнал владельцу.
+"""Исходящий HTTP сервиса: Graph API Instagram и аварийный сигнал владельцу установки.
 
 Хост Graph один — graph.instagram.com (флоу Instagram Login; graph.facebook.com этот
 маркер не принимает, отвечает 401 «Cannot parse access token»).
 
-Второй адресат — telegram-service по внутренней сети docker. Отдельный модуль ради
-одной функции алерта — лишняя сущность, а прятать её в диспетчер нельзя: продление
-токена сигналит владельцу мимо диспетчера.
+Второй адресат — Telegram Bot API напрямую. Промежуточных звеньев на пути аварийного
+сигнала нет намеренно: каждое из них — ещё одна вещь, которая ломается молча, а сигнал
+об остановке механики обязан пережить остановку механики. Отдельный модуль ради одной
+функции алерта не лишний: продление токена сигналит владельцу мимо диспетчера.
 
-Токен в лог не попадает никогда: в POST он уходит в теле, а у GET-продления из
-сообщений об ошибке режется query-строка.
+Ни один токен в лог не попадает: у Meta он уходит в теле POST, а у GET-продления из
+сообщений об ошибке режется query-строка; у бота токен лежит в ПУТИ адреса, поэтому
+адрес не подставляется ни в одно сообщение, а logsafe затирает его на выходе.
 """
 
 import logging
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
@@ -19,10 +22,9 @@ import httpx
 import logsafe
 from rules import MAX_MESSAGE_BYTES, clip
 from config import (
-    IG_ALERT_TG_USER_ID,
-    IG_ALERT_TOKEN,
+    IG_ALERT_BOT_TOKEN,
+    IG_ALERT_CHAT_ID,
     IG_GRAPH_VERSION,
-    TELEGRAM_SERVICE_URL,
 )
 
 log = logging.getLogger("meta")
@@ -61,8 +63,8 @@ TOKEN_CODES = {190}
 RATE_CODES = {4, 17, 32, 613}
 # Зондировано владельцем 25.08.2026 живым запросом: получателя не существует, тело принято.
 TERMINAL_CODES = {(100, 2534014)}
-# ПУСТЫ НАМЕРЕННО. Заполняются двумя зондами на живом аккаунте (приёмка этапа 2 всё равно
-# требует живого прогона), после чего сюда вписывается пара из ответа:
+# ПУСТЫ НАМЕРЕННО. Заполняются двумя зондами на живом аккаунте, после чего сюда
+# вписывается пара из ответа:
 #   1) POST /{comment_id}/replies ... затем POST /me/messages с recipient:{comment_id}
 #      ДВАЖДЫ на один и тот же комментарий  → пара для DUPLICATE_CODES;
 #   2) POST /me/messages в диалог, где 24-часовое окно закрыто → пара для WINDOW_CODES.
@@ -218,31 +220,110 @@ async def refresh_token(token: str) -> tuple[str, int]:
     return str(data.get("access_token") or ""), int(data.get("expires_in") or 0)
 
 
-# ---------- Алерт владельцу ----------
+# ---------- Алерт владельцу установки ----------
+
+TELEGRAM_API = "https://api.telegram.org"
+ALERT_TIMEOUT_SEC = 10
+# Лимит Telegram на текст сообщения — 4096 символов; режем с запасом сами.
+# 400 от Bot API на длинном алерте — это молчание ровно в тот момент, ради которого
+# канал и заведён, а длина сообщения об аварии от нас не зависит.
+MAX_ALERT_CHARS = 4000
+
+# СОСТОЯНИЕ КАНАЛА, а не факт вызова функции. «Функция не упала» и «сообщение дошло» —
+# разные утверждения, и при сломанном канале расходятся именно они: alert_owner умеет
+# написать ERROR в лог, а логи установщика никто не читает. Поэтому наружу отдаётся
+# ВРЕМЯ последней успешной доставки (/ig/admin/state, панель, doctor.sh): «никогда» —
+# это отдельный вердикт «канал не проверен», а не ноль в счётчике.
+last_alert_ok_at: datetime | None = None
+last_alert_error: str | None = None
 
 
-async def alert_owner(text: str) -> None:
-    """Аварийный сигнал в бот. Через web не идём — лишнее звено на пути аварийного сигнала.
+def channel_configured() -> bool:
+    """Есть ли кому и чем слать. У групп chat_id отрицательный — отсюда lstrip('-')."""
+    return bool(IG_ALERT_BOT_TOKEN) and IG_ALERT_CHAT_ID.lstrip("-").isdigit()
+
+
+def channel_state() -> dict:
+    """Что показать человеку про канал алертов. Секретов здесь нет и быть не должно."""
+    return {
+        "configured": channel_configured(),
+        "last_ok_at": last_alert_ok_at.isoformat() if last_alert_ok_at else None,
+        "last_error": last_alert_error,
+    }
+
+
+async def alert_owner(text: str) -> bool:
+    """Аварийный сигнал в свой бот. True — Telegram подтвердил доставку.
 
     Молчать здесь нельзя: тихая деградация в этой механике неотличима от «всё работает»,
-    потому что отсутствие DM никто не наблюдает. Если отправить не удалось — пишем ERROR,
-    это единственный оставшийся канал.
+    потому что отсутствие директа никто не наблюдает. Не удалось отправить — ERROR в лог
+    (последний оставшийся канал) и отметка в last_alert_error, которую видно снаружи.
+
+    Адрес запроса не подставляется ни в одно сообщение: токен бота лежит в ПУТИ, а не в
+    query-строке, и safe_url его не срезает. По той же причине от исключения берётся
+    только имя класса.
     """
+    global last_alert_ok_at, last_alert_error
     log.warning("алерт владельцу: %s", text)
-    if not IG_ALERT_TG_USER_ID.isdigit() or not IG_ALERT_TOKEN:
-        log.error("алерт отправить некому: не задан IG_ALERT_TG_USER_ID или IG_ALERT_TOKEN")
-        return
+    if not channel_configured():
+        last_alert_error = "канал не настроен: пусты IG_ALERT_BOT_TOKEN или IG_ALERT_CHAT_ID"
+        log.error("алерт отправить некому — %s", last_alert_error)
+        return False
     try:
         resp = await client().post(
-            f"{TELEGRAM_SERVICE_URL}/bot/send",
-            json={"tg_user_id": int(IG_ALERT_TG_USER_ID), "text": text},
-            headers={"X-Internal-Token": IG_ALERT_TOKEN},
-            timeout=10,
+            f"{TELEGRAM_API}/bot{IG_ALERT_BOT_TOKEN}/sendMessage",
+            json={
+                "chat_id": IG_ALERT_CHAT_ID,
+                "text": text[:MAX_ALERT_CHARS],
+                "disable_web_page_preview": True,
+            },
+            timeout=ALERT_TIMEOUT_SEC,
         )
-        if resp.is_error:
-            log.error("алерт не доставлен, бот ответил %s", resp.status_code)
-    except Exception:
-        log.exception("алерт не доставлен")
+    except Exception as exc:
+        last_alert_error = f"до Telegram не достучались: {type(exc).__name__}"
+        log.error("алерт не доставлен — %s", last_alert_error)
+        return False
+    if resp.is_error or not _accepted(resp):
+        # Описание отказа от Telegram («chat not found», «bot was blocked by the user»)
+        # — это ровно то, что установщику нужно прочитать; токена в нём нет.
+        last_alert_error = f"Telegram ответил {resp.status_code}: {_description(resp)}"
+        log.error("алерт не доставлен — %s", last_alert_error)
+        return False
+    last_alert_ok_at = datetime.now(timezone.utc)
+    last_alert_error = None
+    return True
+
+
+async def send_test_alert() -> bool:
+    """Проба канала для install.sh и doctor.sh: сообщение шлём мы, ПОДТВЕРЖДАЕТ человек.
+
+    Машина видит только «Telegram принял». Дошло ли до мессенджера, знает тот, кто в него
+    смотрит, — поэтому и установка, и доктор спрашивают человека, а не считают проверку
+    пройденной по коду возврата.
+    """
+    return await alert_owner(
+        "Проверка канала: если вы читаете это сообщение, аварийные сигналы Instagram-"
+        "автоответчика доходят. Другого способа узнать об остановке автоответов нет."
+    )
+
+
+def _accepted(resp: httpx.Response) -> bool:
+    """Bot API отвечает 200 с {"ok": false} тоже — код ответа сам по себе не приговор."""
+    try:
+        data = resp.json()
+    except ValueError:
+        return False
+    return isinstance(data, dict) and data.get("ok") is True
+
+
+def _description(resp: httpx.Response) -> str:
+    try:
+        data = resp.json()
+    except ValueError:
+        data = {}
+    if isinstance(data, dict) and data.get("description"):
+        return str(data["description"])[:200]
+    return f"нераспознанный ответ ({len(resp.content)} байт)"
 
 
 # ---------- Транспорт ----------

@@ -15,7 +15,8 @@ from config import EVENT_RETENTION_DAYS, IG_DATABASE_URL
 log = logging.getLogger("db")
 
 MIGRATIONS_DIR = Path(__file__).resolve().parent / "migrations"
-# Роль и схему заводит суперюзер (scripts/deploy.sh до up -d), сервису это не по правам.
+# Роль и схему заводит суперюзер при первом старте Postgres (файл смонтирован в
+# /docker-entrypoint-initdb.d), сервису это не по правам — мигратор его пропускает.
 BOOTSTRAP_SQL = "000_role.sql"
 # Два контейнера сервиса не должны поехать миграциями одновременно.
 MIGRATION_LOCK_KEY = 8020_2608
@@ -119,7 +120,7 @@ async def insert_events(events: list[tuple[str, str, dict]]) -> int:
 async def purge_old_events() -> int:
     """Ретеншен журнала: старше EVENT_RETENTION_DAYS и УЖЕ обработанное.
 
-    Необработанное не выбрасываем: диспетчер этапа 2 может стоять на паузе (мёртвый токен —
+    Необработанное не выбрасываем: диспетчер может стоять на паузе (мёртвый токен —
     штатный сценарий плана), и тогда эта строка — единственный след, что комментарий
     приходил и остался без ответа.
     """
@@ -133,9 +134,9 @@ async def purge_old_events() -> int:
         return cur.rowcount
 
 
-# ---------- Этап 2: правила и доставка ----------
-# Весь SQL сервиса живёт здесь, как и раньше: прямые запросы, значения только через %s.
-# Форма claim'а — та же, что в очереди CRM (FOR UPDATE SKIP LOCKED).
+# ---------- Правила и доставка ----------
+# Весь SQL сервиса живёт здесь: прямые запросы, значения только через %s.
+# Форма claim'а обычная для очереди на Postgres: FOR UPDATE SKIP LOCKED.
 
 
 async def load_rules(conn) -> list[dict]:
@@ -437,8 +438,8 @@ async def mark_token_invalid(reason: str) -> None:
         )
 
 
-# ---------- Этап 5: админ-API правил ----------
-# CRUD для формы в CRM. Читает и пишет ТОЛЬКО instagram.ig_rule: правило — это
+# ---------- Админ-API правил ----------
+# CRUD для панели. Читает и пишет ТОЛЬКО instagram.ig_rule: правило — это
 # единственное, что человек заводит руками. Доставки, события и токен админка не трогает.
 
 

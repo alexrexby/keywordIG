@@ -20,6 +20,10 @@ SECRET_PARAM = re.compile(
 )
 # Токен Instagram узнаётся и без имени параметра: у него собственный префикс.
 BARE_TOKEN = re.compile(r"\bIGAA[A-Za-z0-9_\-]{10,}")
+# Токен бота Telegram лежит в ПУТИ адреса (/bot<id>:<секрет>/sendMessage), а не в
+# query-строке — срезание параметров его не ловит. Мы сами адрес в сообщения не кладём,
+# но это последний рубеж: печатает адреса третья сторона, а не мы.
+BOT_TOKEN = re.compile(r"/bot\d{5,}:[A-Za-z0-9_\-]{20,}")
 MASK = "<скрыто>"
 
 # Болтливые библиотеки: печатают адрес запроса на INFO. Уровень поднимаем, но полагаться
@@ -29,6 +33,7 @@ NOISY = ("httpx", "httpcore")
 
 def redact(text: str) -> str:
     text = SECRET_PARAM.sub(lambda m: f"{m.group(1)}={MASK}", text)
+    text = BOT_TOKEN.sub(f"/bot{MASK}", text)
     return BARE_TOKEN.sub(MASK, text)
 
 
