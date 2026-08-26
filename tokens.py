@@ -63,6 +63,11 @@ class TokenState:
     value: str | None
     expires_at: datetime | None
     invalid_at: datetime | None
+    # Когда Meta в последний раз ПОДТВЕРДИЛА срок жизни продлением. None означает, что
+    # в expires_at стоит горизонт зонда (PROBE_HORIZON), а не настоящий срок: обратный
+    # отсчёт «истекает через N суток» по такому значению — враньё человеку, поэтому
+    # панель показывает его только при непустом refreshed_at.
+    refreshed_at: datetime | None = None
 
     @property
     def usable(self) -> bool:
@@ -119,7 +124,7 @@ async def state(force: bool = False) -> TokenState:
             # чем сыпать исключением на каждой отправке.
             log.exception("токен не расшифровывается")
             value = None
-        current = TokenState(value, row["expires_at"], row["invalid_at"])
+        current = TokenState(value, row["expires_at"], row["invalid_at"], row["refreshed_at"])
     _cache = (_now().timestamp(), current)
     return current
 

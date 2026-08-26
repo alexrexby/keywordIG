@@ -10,7 +10,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 
-from config import EVENT_RETENTION_DAYS, IG_DATABASE_URL
+from config import DELIVERY_RETENTION_DAYS, EVENT_RETENTION_DAYS, IG_DATABASE_URL
 
 log = logging.getLogger("db")
 
@@ -130,6 +130,38 @@ async def purge_old_events() -> int:
             " WHERE received_at < now() - make_interval(days => %s)"
             "   AND processed_at IS NOT NULL",
             (EVENT_RETENTION_DAYS,),
+        )
+        return cur.rowcount
+
+
+async def purge_old_deliveries() -> int:
+    """Ретеншен КАРТОЧЕК ОБРАЩЕНИЙ: старше DELIVERY_RETENTION_DAYS и уже не в работе.
+
+    Это не гигиена диска, а исполнение обещания: срок из публичной политики
+    конфиденциальности и это число — одно и то же значение (config.DELIVERY_RETENTION_DAYS).
+    Не удалять и обещать срок — значит опубликовать документ, который сервис не соблюдает.
+    Ноль отключает чистку; тогда и страница пишет «пока работает сервис», а не срок.
+
+    Что переживает чистку и почему:
+      • instagram.ig_contact_rule — отметка «этому человеку по этому правилу материал уже
+        выдавали». Снять её значит выдать материал второй раз тому, кто его получил, —
+        а «дважды одно и то же не отправляем» обещано в той же политике. Персональных
+        данных в ней минимум: пара «правило + номер человека», ни текста, ни имени.
+        Внешнего ключа на ig_delivery у неё нет (миграция 002), поэтому удаление карточки
+        отметку не тронет и по каскаду;
+      • всё, что ЕЩЁ В РАБОТЕ (PENDING, CLAIMED, REPLIED_PUBLIC, SENT_DM): удалить такую
+        строку — потерять ответ человеку. Перечислены именно рабочие состояния, а не
+        терминальные: список терминальных растёт от этапа к этапу, и забытое в нём
+        состояние копилось бы вечно, тогда как забытое рабочее чинится громко.
+    """
+    if DELIVERY_RETENTION_DAYS <= 0:
+        return 0
+    async with pool_ref().connection() as conn:
+        cur = await conn.execute(
+            "DELETE FROM instagram.ig_delivery"
+            " WHERE created_at < now() - make_interval(days => %s)"
+            "   AND state NOT IN ('PENDING', 'CLAIMED', 'REPLIED_PUBLIC', 'SENT_DM')",
+            (DELIVERY_RETENTION_DAYS,),
         )
         return cur.rowcount
 
@@ -388,6 +420,60 @@ async def count_pending() -> int:
         return (await cur.fetchone())[0]
 
 
+async def queue_pressure() -> dict:
+    """Очередь одним запросом: сколько ждёт, сколько ждёт ПОВТОРНОЙ попытки, когда был
+    последний отказ.
+
+    Три числа вместе — это диагноз «Instagram не принимает отправки», а по отдельности
+    три строки статистики: очередь непуста и при мёртвом токене, и при живом, разница
+    ровно в том, ждут ли доставки ретрая после отказа платформы.
+
+    retrying = отложенная (run_after в будущем) строка С ЗАПИСАННЫМ ОТКАЗОМ. Не по
+    attempts > 0: попытку жгут не всякий отказ — лимит темпа Meta и мёртвый токен
+    откатывают счётчик намеренно (dispatcher.reschedule_delivery, count_attempt=False),
+    и по attempts самый частый вид «платформа не принимает» был бы невидим. Свежая
+    доставка тоже PENDING, но у неё run_after в прошлом и last_error пуст.
+    """
+    async with pool_ref().connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                "SELECT count(*) FILTER (WHERE state = 'PENDING') AS pending,"
+                "       count(*) FILTER (WHERE state = 'PENDING' AND run_after > now()"
+                "                          AND last_error IS NOT NULL) AS retrying,"
+                "       max(updated_at) FILTER (WHERE last_error IS NOT NULL"
+                "                          AND updated_at > now() - interval '24 hours')"
+                "         AS last_error_at"
+                "  FROM instagram.ig_delivery"
+            )
+            return await cur.fetchone()
+
+
+async def event_stats() -> dict:
+    """Уведомления от платформы: когда пришло последнее и приходили ли они ВООБЩЕ КОГДА-ЛИБО.
+
+    «Ни одного за всё время» — отдельный вердикт, а не ноль в счётчике: это единственный
+    наблюдаемый признак неопубликованного приложения Meta (уведомления не идут вовсе и
+    без единой ошибки, подписка при этом выглядит настроенной), и именно на нём застревает
+    установка.
+
+    Отличить «ни разу» от «давно» по строкам таблицы нельзя: журнал чистится через
+    EVENT_RETENTION_DAYS, и молчащая полгода установка выглядела бы новорождённой.
+    Поэтому «когда-либо» спрашивается у ПОСЛЕДОВАТЕЛЬНОСТИ: она переживает и чистку, и
+    ретеншен, а тронута бывает ровно тогда, когда сервис принял хоть одно подписанное
+    тело (значение расходуется и на повторной доставке, которую съедает ON CONFLICT, —
+    для этого вердикта это тоже «уведомление приходило»).
+    """
+    async with pool_ref().connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                "SELECT count(*) AS kept, max(received_at) AS last_at,"
+                "       pg_sequence_last_value('instagram.ig_event_id_seq') IS NOT NULL"
+                "         AS ever_received"
+                "  FROM instagram.ig_event"
+            )
+            return await cur.fetchone()
+
+
 async def count_states_since(hours: int) -> dict[str, int]:
     """Доставки за окно, разложенные по состояниям. Сумма здесь не нужна — нужна ДОЛЯ.
 
@@ -455,9 +541,11 @@ async def mark_token_invalid(reason: str) -> None:
         )
 
 
-# ---------- Админ-API правил ----------
-# CRUD для панели. Читает и пишет ТОЛЬКО instagram.ig_rule: правило — это
-# единственное, что человек заводит руками. Доставки, события и токен админка не трогает.
+# ---------- Админ-API ----------
+# Правила человек ЗАВОДИТ — их админка читает и пишет. Доставки она только ЧИТАЕТ, и
+# единственная запись за пределами ig_rule — снятие брони (admin_release_contact):
+# выяснить, дошло ли сообщение, машина не может, а человек может.
+# События и токен админка не трогает вовсе.
 
 
 class RuleRejected(Exception):
@@ -465,15 +553,21 @@ class RuleRejected(Exception):
     а не CheckViolation: форма не должна показывать владельцу сырую ошибку Postgres."""
 
 
-# Правило целиком, как его видит форма: то же, что читает диспетчер, плюс enabled,
-# create_lead_on и метки времени — редактору нужна вся строка, а не только поля доставки.
+# Правило целиком, как его видит форма: то же, что читает диспетчер, плюс enabled
+# и метки времени — редактору нужна вся строка, а не только поля доставки.
+# create_lead_on сюда НЕ входит: колонка осталась от связки с чужой CRM, её не читает
+# ни одна строка кода (этап «лид в CRM» отменён выделением пакета). Настройка, которая
+# ничего не делает, — это обещание, которого никто не давал, поэтому наружу она не идёт
+# ни в API, ни в панель. Из схемы колонка не убрана намеренно: DEFAULT 'REPLY' ставит
+# база, копирование правила переносит её само, а миграция ради мёртвого поля — риск
+# без выгоды.
 ADMIN_RULE_COLUMNS = (
     'id, name, enabled, "trigger", media_id, keywords, match_mode, priority,'
-    " public_replies, duplicate_replies, dm_text, dm_buttons, create_lead_on,"
+    " public_replies, duplicate_replies, dm_text, dm_buttons,"
     " created_at, updated_at"
 )
-# Порядок записи. Ровно эти двенадцать полей админка и меняет; id и метки времени
-# ставит база. Список один на INSERT и UPDATE, чтобы они не разъехались.
+# Порядок записи. Ровно эти одиннадцать полей админка и меняет; id, метки времени и
+# create_lead_on ставит база. Список один на INSERT и UPDATE, чтобы они не разъехались.
 ADMIN_RULE_FIELDS = (
     "name",
     "enabled",
@@ -486,7 +580,6 @@ ADMIN_RULE_FIELDS = (
     "duplicate_replies",
     "dm_text",
     "dm_buttons",
-    "create_lead_on",
 )
 
 
@@ -556,8 +649,8 @@ async def admin_insert_rule(values: dict) -> dict:
                 await cur.execute(
                     "INSERT INTO instagram.ig_rule"
                     ' (name, enabled, "trigger", media_id, keywords, match_mode, priority,'
-                    "  public_replies, duplicate_replies, dm_text, dm_buttons, create_lead_on)"
-                    " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
+                    "  public_replies, duplicate_replies, dm_text, dm_buttons)"
+                    " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
                     f" RETURNING {ADMIN_RULE_COLUMNS}",
                     _rule_params(values),
                 )
@@ -567,7 +660,7 @@ async def admin_insert_rule(values: dict) -> dict:
 
 
 async def admin_update_rule(rule_id: int, values: dict) -> dict | None:
-    """Пишет все двенадцать полей разом: частичные правки сводит воедино админка,
+    """Пишет все одиннадцать полей разом: частичные правки сводит воедино админка,
     а сюда приходит уже целое правило. Динамического SQL поэтому нет вовсе."""
     async with pool_ref().connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
@@ -577,7 +670,7 @@ async def admin_update_rule(rule_id: int, values: dict) -> dict | None:
                     '   name = %s, enabled = %s, "trigger" = %s, media_id = %s,'
                     "   keywords = %s, match_mode = %s, priority = %s,"
                     "   public_replies = %s, duplicate_replies = %s, dm_text = %s,"
-                    "   dm_buttons = %s, create_lead_on = %s, updated_at = now()"
+                    "   dm_buttons = %s, updated_at = now()"
                     f" WHERE id = %s RETURNING {ADMIN_RULE_COLUMNS}",
                     _rule_params(values) + (rule_id,),
                 )
@@ -666,3 +759,51 @@ async def admin_count_contacts(rule_id: int) -> int:
             "SELECT count(*) FROM instagram.ig_contact_rule WHERE rule_id = %s", (rule_id,)
         )
         return (await cur.fetchone())[0]
+
+
+# ---------- Очередь: чтение и снятие брони ----------
+
+
+async def admin_list_deliveries(limit: int) -> list[dict]:
+    """Последние обращения: что пришло, что с этим стало, висит ли бронь.
+
+    holds_contact — не украшение: это единственный признак, по которому в панели видно,
+    у кого можно снять бронь. LEFT JOIN по delivery_id, а не по паре (rule_id, igsid):
+    интересует именно та отметка, которую поставила ЭТА доставка, — по паре нашлась бы
+    и чужая, оставленная предыдущей.
+    """
+    async with pool_ref().connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                "SELECT d.id, d.source, d.state, d.igsid, d.username, d.media_id,"
+                "       d.source_text, d.rule_id, r.name AS rule_name, d.attempts,"
+                "       d.dm_attempts, d.dm_message_id, d.public_reply_id, d.last_error,"
+                "       d.run_after, d.expires_at, d.created_at, d.updated_at,"
+                "       (c.delivery_id IS NOT NULL) AS holds_contact"
+                "  FROM instagram.ig_delivery d"
+                "  LEFT JOIN instagram.ig_rule r ON r.id = d.rule_id"
+                "  LEFT JOIN instagram.ig_contact_rule c ON c.delivery_id = d.id"
+                " ORDER BY d.id DESC LIMIT %s",
+                (limit,),
+            )
+            return await cur.fetchall()
+
+
+async def admin_release_contact(delivery_id: int) -> int:
+    """Снимает бронь «материал уже выдавали» ПО РЕШЕНИЮ ЧЕЛОВЕКА. Возвращает 0 или 1.
+
+    Отличие от release_contact_rule ровно одно, и оно намеренное: там условие «материал
+    доказанно не уходил» (dm_attempts = 0), здесь условия нет. Выяснить, дошло ли
+    сообщение, машина не может — ответ Meta потерян именно поэтому, — а владелец
+    установки может: он открывает свой директ и смотрит. Кнопка и есть его ответ.
+    Цена ошибки известна и ограничена: человек получит материал второй раз.
+
+    Отправку это НЕ запускает: доставка уже терминальная. Снятая бронь возвращает
+    человеку возможность получить материал по СЛЕДУЮЩЕМУ обращению — до этого повторный
+    комментарий получал бы публичное «уже отправляли».
+    """
+    async with pool_ref().connection() as conn:
+        cur = await conn.execute(
+            "DELETE FROM instagram.ig_contact_rule WHERE delivery_id = %s", (delivery_id,)
+        )
+        return cur.rowcount

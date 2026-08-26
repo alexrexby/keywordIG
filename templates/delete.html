@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% block title %}Удалить правило{% endblock %}
+{% block body %}
+<div class="card down">
+  <h1>Удалить правило «{{ rule.name }}»?</h1>
+  <p>Вернуть его будет нечем.</p>
+  <p>
+    Вместе с правилом снимутся отметки «этому человеку материал уже выдавали» — сейчас
+    таких {{ released }}. Если кто-то из них снова напишет кодовое слово, материал уйдёт
+    ему второй раз.
+  </p>
+  <p>Если правило просто мешает — его можно выключить, тогда отметки останутся.</p>
+  {% if rule.enabled %}
+  <p><b>Правило сейчас включено и отвечает людям.</b></p>
+  {% endif %}
+</div>
+<div class="buttons">
+  <form method="post" action="/panel/rules/{{ rule.id }}/delete">
+    <input type="hidden" name="_csrf" value="{{ csrf }}">
+    <button class="risky" type="submit">Удалить</button>
+  </form>
+  {% if rule.enabled %}
+  <form method="post" action="/panel/rules/{{ rule.id }}/enabled">
+    <input type="hidden" name="_csrf" value="{{ csrf }}">
+    <input type="hidden" name="enabled" value="0">
+    <button type="submit">Выключить</button>
+  </form>
+  {% endif %}
+  <a href="/panel/rules/{{ rule.id }}"><button class="main" type="button">Отмена</button></a>
+</div>
+{% endblock %}

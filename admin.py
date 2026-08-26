@@ -1,8 +1,10 @@
-"""Машинный админ-API правил: CRUD, предпросмотр шаблона, замена токена, состояние.
+"""Машинный админ-API: правила, очередь, предпросмотр шаблона, замена токена, состояние.
 
 Это API, а не страница для человека: JSON, ключ IG_ADMIN_TOKEN в заголовке, никаких
 cookie и форм. Снаружи /ig/admin/* закрыт ещё и на прокси (403 в caddy/Caddyfile), то
-есть ключ — вторые ворота, а не единственные.
+есть ключ — вторые ворота, а не единственные. Страницу для человека рисует panel.py, и
+рисует он ЭТИ ЖЕ функции (save_rule, duplicate_rule, accept_token, state) — второго
+движка правил, второго набора текстов отказа и второй дороги в базу в проекте нет.
 
 ДВИЖОК ТЕКСТОВ ЖИВЁТ В rules.py, И ТОЛЬКО ТАМ. Форма не считает длину, не раскрывает
 варианты и не проверяет скобки сама: два движка неизбежно разъедутся, и человек увидит
@@ -61,10 +63,13 @@ _rejected_logged_at: float | None = None
 
 TRIGGERS = ("COMMENT", "DM", "BOTH")
 MATCH_MODES = ("CONTAINS", "EXACT")
-LEAD_MODES = ("REPLY", "DM_SENT", "NEVER")
 MAX_KEYWORDS = 50
 MAX_NAME_LEN = 200
 MAX_REPLY_VARIANTS = 50
+# Сколько последних обращений отдаёт очередь. Больше в один экран человек всё равно не
+# читает, а панель показывает их таблицей на телефоне.
+DELIVERIES_PAGE = 50
+MAX_DELIVERIES_PAGE = 200
 
 # Пометка копии в названии и она же — то, что срезается перед новой пометкой. Иначе
 # копия копии копии называлась бы «X (копия) (копия) (копия)», а номер поколения читался
@@ -103,9 +108,11 @@ FIELDS = {
     "duplicate_replies": ("list", []),
     "dm_text": ("str", _REQUIRED),
     "dm_buttons": ("buttons", []),
-    "create_lead_on": ("enum", "REPLY"),
+    # create_lead_on здесь НЕТ намеренно: колонка осталась от связки с чужой CRM, её не
+    # читает ни одна строка кода, и редактируемое поле, которое ни на что не влияет, —
+    # это обещание, которого никто не давал. Значение ставит база своим DEFAULT.
 }
-ENUMS = {"trigger": TRIGGERS, "match_mode": MATCH_MODES, "create_lead_on": LEAD_MODES}
+ENUMS = {"trigger": TRIGGERS, "match_mode": MATCH_MODES}
 
 
 def require_admin(request: Request) -> None:
@@ -143,11 +150,50 @@ router = APIRouter(prefix="/ig/admin", dependencies=[Depends(require_admin)])
 @router.get("/rules")
 async def list_rules():
     rows = await db.admin_list_rules()
-    return {"rules": [_view(row) for row in rows]}
+    return {"rules": [rule_view(row) for row in rows]}
 
 
 # Отдельного GET /rules/{id} нет намеренно: список отдаёт правила целиком, и форме
 # нечего дочитывать. Лишний роут — это лишняя поверхность, которую кто-то будет ревьюить.
+
+
+async def save_rule(body: dict, current: dict | None) -> tuple[dict | None, list[str], list[str]]:
+    """Сохранение правила: ОДНА дорога для JSON-API и для панели.
+
+    Возвращает (строка правила, ошибки, предупреждения). current=None — создание, иначе
+    правка уже прочитанной строки. Пустой row без ошибок означает «правило исчезло между
+    чтением и записью»: его удалили, и вызывающему это 404, а не отказ валидации.
+
+    Отдельной функцией, а не «панель повторит то же самое»: разъехавшиеся проверки — это
+    правило, сохранённое из формы и отвергнутое API (или наоборот), и объяснить такое
+    человеку нечем.
+    """
+    # Соседей читаем, только если правило заводят/оставляют включённым: черновик никого
+    # перекрыть не может, а лишний запрос на каждое сохранение — плата ни за что.
+    values, errors, warnings = _prepare(
+        body,
+        current=current,
+        siblings=await _siblings(body, current),
+        rule_id=current["id"] if current else None,
+    )
+    if errors:
+        return None, errors, []
+    try:
+        if current is None:
+            row = await db.admin_insert_rule(values)
+        else:
+            row = await db.admin_update_rule(current["id"], values)
+    except db.RuleRejected as exc:
+        return None, [str(exc)], []
+    if row is not None:
+        log.info(
+            "правило %s %s: «%s», enabled=%s",
+            row["id"],
+            "заведено" if current is None else "изменено",
+            row["name"],
+            row["enabled"],
+        )
+    return row, [], warnings
 
 
 @router.post("/rules")
@@ -155,24 +201,13 @@ async def create_rule(request: Request):
     body = await _body(request)
     if isinstance(body, JSONResponse):
         return body
-    # Соседей читаем, только если правило заводят сразу включённым: черновик никого
-    # перекрыть не может, а лишний запрос на каждое сохранение — плата ни за что.
-    values, errors, warnings = _prepare(body, current=None, siblings=await _siblings(body, None))
+    row, errors, warnings = await save_rule(body, current=None)
     if errors:
         return _rejected(errors)
-    try:
-        row = await db.admin_insert_rule(values)
-    except db.RuleRejected as exc:
-        return _rejected([str(exc)])
-    log.info("правило %s заведено: «%s», enabled=%s", row["id"], row["name"], row["enabled"])
-    return {"rule": _view(row), "warnings": warnings}
+    return {"rule": rule_view(row), "warnings": warnings}
 
 
-# 201, а не 200 как у POST /rules: это контракт с формой, и он же честнее — в отличие
-# от создания, копия рождается без единого поля от клиента, и ссылаться дальше форме
-# не на что, кроме id из тела. Разнобой намеренный, выравнивать его не надо.
-@router.post("/rules/{rule_id}/copy", status_code=201)
-async def copy_rule(rule_id: int):
+async def duplicate_rule(rule_id: int) -> tuple[dict | None, list[str], list[str]]:
     """Копия правила под соседний лид-магнит: тексты, кнопки и настройки совпадают,
     заводить их заново по одному полю — работа ни о чём.
 
@@ -194,20 +229,23 @@ async def copy_rule(rule_id: int):
     Само копирование делает база (db.admin_copy_rule) — там же, почему не в питоне.
     Проверки те же и теми же функциями, что при создании руками, но их находки здесь не
     отказ, а ПРЕДУПРЕЖДЕНИЯ — см. ниже по коду.
+
+    Возвращает (строка копии, ошибки, предупреждения) — одна дорога для API и панели.
+    Пустой row без ошибок означает «копировать нечего»: правила уже нет.
     """
     current = await db.admin_get_rule(rule_id)
     if current is None:
-        return _not_found(rule_id)
+        return None, [], []
     # Из снимка берётся ТОЛЬКО название: его надо придумать до вставки, и оно всё равно
     # своё. Содержимое копии из снимка не берётся вовсе — строку читает сам INSERT.
     taken = await db.admin_rule_names()
     try:
         row = await db.admin_copy_rule(rule_id, _copy_name(current["name"], taken))
     except db.RuleRejected as exc:
-        return _rejected([str(exc)])
+        return None, [str(exc)], []
     if row is None:
         # Правило удалили между чтением и вставкой. Копировать стало нечего.
-        return _not_found(rule_id)
+        return None, [], []
 
     # Разбираем СОЗДАННУЮ строку, а не снимок. Между двумя чтениями исходник мог
     # измениться — руками по рецепту из 003_seed_rule.sql («UPDATE … WHERE name = …»)
@@ -232,7 +270,20 @@ async def copy_rule(rule_id: int):
     if reason:
         warnings.append(f"копию нельзя будет включить — {reason}")
     log.info("правило %s скопировано в %s: «%s»", rule_id, row["id"], row["name"])
-    return {"rule": _view(row), "warnings": warnings}
+    return row, [], warnings
+
+
+# 201, а не 200 как у POST /rules: это контракт с формой, и он же честнее — в отличие
+# от создания, копия рождается без единого поля от клиента, и ссылаться дальше форме
+# не на что, кроме id из тела. Разнобой намеренный, выравнивать его не надо.
+@router.post("/rules/{rule_id}/copy", status_code=201)
+async def copy_rule(rule_id: int):
+    row, errors, warnings = await duplicate_rule(rule_id)
+    if errors:
+        return _rejected(errors)
+    if row is None:
+        return _not_found(rule_id)
+    return {"rule": rule_view(row), "warnings": warnings}
 
 
 @router.patch("/rules/{rule_id}")
@@ -243,19 +294,12 @@ async def update_rule(rule_id: int, request: Request):
     current = await db.admin_get_rule(rule_id)
     if current is None:
         return _not_found(rule_id)
-    values, errors, warnings = _prepare(
-        body, current=current, siblings=await _siblings(body, current), rule_id=rule_id
-    )
+    row, errors, warnings = await save_rule(body, current=current)
     if errors:
         return _rejected(errors)
-    try:
-        row = await db.admin_update_rule(rule_id, values)
-    except db.RuleRejected as exc:
-        return _rejected([str(exc)])
     if row is None:
         return _not_found(rule_id)
-    log.info("правило %s изменено: «%s», enabled=%s", row["id"], row["name"], row["enabled"])
-    return {"rule": _view(row), "warnings": warnings}
+    return {"rule": rule_view(row), "warnings": warnings}
 
 
 @router.delete("/rules/{rule_id}")
@@ -313,25 +357,20 @@ async def preview(request: Request):
 # ---------- Токен и состояние ----------
 
 
-@router.post("/token")
-async def replace_token(request: Request):
-    """Замена Instagram User Access Token без правки .env и без рестарта контейнера.
+async def accept_token(value: str) -> tuple[datetime | None, str]:
+    """Замена Instagram User Access Token без правки файла окружения и без рестарта.
+
+    Возвращает (срок жизни, текст отказа). Одна дорога для API и панели.
 
     Значение не возвращается и не логируется никогда — ни в ответе, ни в тексте ошибки
     (фильтр logsafe затирает только то, что дошло до логгера; сюда оно не доходит вовсе).
     """
-    body = await _body(request)
-    if isinstance(body, JSONResponse):
-        return body
-    value = body.get("token")
-    if not isinstance(value, str) or not value.strip():
-        return _rejected(["поле «token» обязательно и должно быть непустой строкой"])
     value = value.strip()
     # Проверяем только форму: длину и отсутствие пробелов. Что токен рабочий, покажет
     # первая же доставка, а держать здесь запрос в Meta нельзя — тогда починка аварии
     # упирается в доступность самой Meta, ради обхода которой всё и затевалось.
     if len(value) < 20 or not value.isascii() or any(ch.isspace() for ch in value):
-        return _rejected(["это не похоже на токен: ожидается одна строка латиницей без пробелов"])
+        return None, "это не похоже на токен: ожидается одна строка латиницей без пробелов"
     expires_at = await tokens.store(value)
     # Проверка ПОСЛЕ ответа, а не до: ответ владельцу не ждёт Meta (иначе починка аварии
     # зависела бы от доступности той самой платформы), но молча принятый мёртвый токен
@@ -339,6 +378,20 @@ async def replace_token(request: Request):
     # Ссылку на задачу держим: без неё сборщик мусора вправе убить её на полпути.
     global _probe_task
     _probe_task = asyncio.create_task(tokens.probe(value))
+    return expires_at, ""
+
+
+@router.post("/token")
+async def replace_token(request: Request):
+    body = await _body(request)
+    if isinstance(body, JSONResponse):
+        return body
+    value = body.get("token")
+    if not isinstance(value, str) or not value.strip():
+        return _rejected(["поле «token» обязательно и должно быть непустой строкой"])
+    expires_at, error = await accept_token(value)
+    if error:
+        return _rejected([error])
     return {
         "ok": True,
         "expires_at": expires_at.isoformat(),
@@ -359,7 +412,8 @@ async def state():
     флаг успеха.
     """
     token = await tokens.state()
-    pending = await db.count_pending()
+    queue = await db.queue_pressure()
+    events = await db.event_stats()
     sent_24h = await db.count_dm_sent_since(24)
     states_24h = await db.count_states_since(24)
     handled_24h = sum(states_24h.values())
@@ -375,8 +429,28 @@ async def state():
             "present": bool(token.value),
             "invalid_at": _moment(token.invalid_at),
             "expires_at": _moment(token.expires_at),
+            # Пока Meta не подтвердила срок ПРОДЛЕНИЕМ, в expires_at стоит горизонт зонда
+            # (tokens.PROBE_HORIZON), а не срок жизни токена. Обратный отсчёт по такому
+            # значению врёт человеку, поэтому признак отдаётся рядом, а не подразумевается.
+            "expires_at_confirmed": token.refreshed_at is not None,
         },
-        "queue": {"pending": pending},
+        # ВЕБХУКИ. «Ни одного за всё время» — отдельный вердикт, а не ноль: это
+        # единственный наблюдаемый признак неопубликованного приложения Meta. kept —
+        # сколько строк ЛЕЖИТ сейчас (журнал чистится через EVENT_RETENTION_DAYS),
+        # ever_received — приходило ли хоть раз с рождения установки.
+        "webhooks": {
+            "ever_received": bool(events["ever_received"]),
+            "kept": events["kept"],
+            "last_at": _moment(events["last_at"]),
+        },
+        # retrying и last_error_at (за сутки) — это вердикт «платформа не принимает
+        # отправки»: очередь непуста и при мёртвом токене, разница ровно в том, ждут ли
+        # доставки СЛЕДУЮЩЕЙ попытки после отказа Meta.
+        "queue": {
+            "pending": queue["pending"],
+            "retrying": queue["retrying"],
+            "last_error_at": _moment(queue["last_error_at"]),
+        },
         "dispatcher": {
             "last_tick_at": _moment(last_tick),
             "stale_sec": int(stale) if stale is not None else None,
@@ -399,6 +473,68 @@ async def state():
         # а не «аварий не было»: это отдельный вердикт, и закрывает его тестовое
         # сообщение (meta.send_test_alert), которое подтверждает ЧЕЛОВЕК.
         "alerts": meta.channel_state(),
+    }
+
+
+# ---------- Очередь ----------
+# Раздел заведён не для полноты API: три аварийных сообщения отправляют человека сюда
+# («откройте раздел «Очередь»»), а одно — предлагает нажать кнопку снятия брони.
+# Пока раздела нет, эти тексты обещают то, чего не существует.
+
+
+@router.get("/deliveries")
+async def list_deliveries(limit: int = DELIVERIES_PAGE):
+    """Последние обращения. Тексты людей отдаются как есть: это и есть то, на чём
+    спотыкается отправка, и без них «не сработало правило» не разобрать."""
+    limit = max(1, min(limit, MAX_DELIVERIES_PAGE))
+    rows = await db.admin_list_deliveries(limit)
+    return {"deliveries": [delivery_view(row) for row in rows]}
+
+
+@router.post("/deliveries/{delivery_id}/release")
+async def release_delivery(delivery_id: int):
+    """Снять бронь «этому человеку материал уже выдавали».
+
+    Взамен SQL-команды, которую прежний алерт присылал прямо в мессенджер: запрос в
+    базу на телефоне — приглашение к беде, а решение при этом принимает всё равно
+    человек, а не машина (dm_attempts > 0 означает «исход неизвестен», и выяснить его
+    можно только заглянув в свой директ).
+
+    Отправку это не запускает — см. db.admin_release_contact.
+    """
+    released = await db.admin_release_contact(delivery_id)
+    if not released:
+        return JSONResponse(
+            {"error": f"на доставке {delivery_id} брони нет — снимать нечего"},
+            status_code=404,
+        )
+    log.info("доставка %s: бронь снята вручную", delivery_id)
+    return {"ok": True, "released": released}
+
+
+def delivery_view(row: dict) -> dict:
+    return {
+        "id": row["id"],
+        "source": row["source"],
+        "state": row["state"],
+        "igsid": row["igsid"],
+        "username": row["username"],
+        "media_id": row["media_id"],
+        "text": row["source_text"],
+        "rule_id": row["rule_id"],
+        "rule_name": row["rule_name"],
+        "attempts": row["attempts"],
+        "dm_attempts": row["dm_attempts"],
+        "dm_sent": bool(row["dm_message_id"]),
+        "replied_public": bool(row["public_reply_id"]),
+        "last_error": row["last_error"],
+        "run_after": _moment(row["run_after"]),
+        "expires_at": _moment(row["expires_at"]),
+        "created_at": _moment(row["created_at"]),
+        "updated_at": _moment(row["updated_at"]),
+        # Признак «есть что снимать»: без него кнопка в панели предлагалась бы на каждой
+        # строке, а срабатывала бы на единицах.
+        "holds_contact": row["holds_contact"],
     }
 
 
@@ -456,7 +592,7 @@ def _not_found(rule_id: int) -> JSONResponse:
     return JSONResponse({"error": f"правила {rule_id} нет"}, status_code=404)
 
 
-def _view(row: dict) -> dict:
+def rule_view(row: dict) -> dict:
     """Строка таблицы → JSON формы. Массивы Postgres приходят списками, jsonb — списком."""
     return {
         "id": row["id"],
@@ -471,7 +607,6 @@ def _view(row: dict) -> dict:
         "duplicate_replies": list(row["duplicate_replies"] or []),
         "dm_text": row["dm_text"],
         "dm_buttons": list(row["dm_buttons"] or []),
-        "create_lead_on": row["create_lead_on"],
         "created_at": _moment(row["created_at"]),
         "updated_at": _moment(row["updated_at"]),
     }

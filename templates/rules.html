@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+{% block title %}Правила{% endblock %}
+{% block body %}
+<h1>Правила</h1>
+{% if not items %}
+<div class="card warn">
+  <p><b>Правил пока нет</b></p>
+  <p>
+    Правило — это ключевое слово и то, что уходит человеку, который его написал.
+    Кто-то оставляет под постом «гайд» — сервис отвечает ему под комментарием
+    и присылает материал в директ.
+  </p>
+  <p>Заведите первое: ключевое слово, ответ под комментарием и сообщение в директ.</p>
+</div>
+{% else %}
+{% if all_off %}
+<div class="warnbox">
+  Правила есть, но все выключены — сервис сейчас никому не отвечает.
+  Комментарии он принимает и записывает, но материал по ним не уходит.
+</div>
+{% endif %}
+{% for item in items %}
+<div class="item">
+  <p>
+    <a href="/panel/rules/{{ item.rule.id }}"><b>{{ item.rule.name }}</b></a>
+    {% if item.rule.enabled %}<span class="meta">· включено</span>
+    {% else %}<span class="off">· выключено</span>{% endif %}
+  </p>
+  <p class="meta">
+    Слова: {{ item.rule.keywords | join(', ') or '—' }} ·
+    {% if item.rule.match_mode == 'EXACT' %}точное совпадение{% else %}внутри текста{% endif %} ·
+    {% if item.rule.trigger == 'COMMENT' %}под комментариями
+    {% elif item.rule.trigger == 'DM' %}в личных сообщениях
+    {% else %}везде{% endif %} ·
+    {% if item.rule.media_id %}пост {{ item.rule.media_id }}{% else %}любой пост{% endif %} ·
+    приоритет {{ item.rule.priority }}
+  </p>
+  {% if item.problem %}
+  <p class="warnbox">Сохранено, но не работает: {{ item.problem }}</p>
+  {% endif %}
+  <div class="buttons">
+    <form method="post" action="/panel/rules/{{ item.rule.id }}/enabled">
+      <input type="hidden" name="_csrf" value="{{ csrf }}">
+      <input type="hidden" name="enabled" value="{{ '0' if item.rule.enabled else '1' }}">
+      <button type="submit">{{ 'Выключить' if item.rule.enabled else 'Включить' }}</button>
+    </form>
+    <form method="post" action="/panel/rules/{{ item.rule.id }}/copy">
+      <input type="hidden" name="_csrf" value="{{ csrf }}">
+      <button type="submit">Сделать копию</button>
+    </form>
+    <a href="/panel/rules/{{ item.rule.id }}/delete"><button class="risky" type="button">Удалить</button></a>
+  </div>
+</div>
+{% endfor %}
+{% endif %}
+<div class="buttons">
+  <a href="/panel/rules/new"><button class="main" type="button">Новое правило</button></a>
+</div>
+{% endblock %}

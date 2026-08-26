@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% block title %}Токен{% endblock %}
+{% block body %}
+<h1>Токен</h1>
+{% if error %}<div class="bad">{{ error }}</div>{% endif %}
+<p>
+  {% if not token.present %}
+  Токена нет: отвечать людям нечем. Всё, что приходит, копится в очереди и уйдёт само,
+  как только токен появится.
+  {% elif token.invalid_at %}
+  Instagram отверг сохранённый токен. Автоответы стоят с {{ token.invalid_at }}.
+  {% elif token.expires_at_confirmed %}
+  Токен живой, сервис продлевает его сам. Ближайший срок: {{ token.expires_at }}.
+  {% else %}
+  Токен сохранён. Настоящий срок жизни станет известен при первом продлении: Meta
+  называет его только тогда, а до этого показывать обратный отсчёт значило бы соврать.
+  {% endif %}
+</p>
+<p class="hint">
+  Пройдите Instagram Business Login под своим аккаунтом и вставьте долгоживущий токен
+  сюда. Перезапускать сервис не нужно: запись снимает пометку «мёртвый», и очередь
+  разбирается сама.
+</p>
+<form method="post" action="/panel/token">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  <label for="token">Новый токен</label>
+  <p class="hint">Токен виден только вам, в ответах и логах он не появляется.</p>
+  <input type="password" id="token" name="token" autocomplete="off">
+  <div class="buttons"><button class="main" type="submit">Вставить токен</button></div>
+</form>
+{% endblock %}

@@ -1,0 +1,170 @@
+{% extends "base.html" %}
+{% block title %}{% if rule %}{{ rule.name }}{% else %}Новое правило{% endif %}{% endblock %}
+{% block body %}
+<h1>{% if rule %}{{ rule.name }}{% else %}Новое правило{% endif %}</h1>
+
+{% if errors %}
+<div class="bad">
+  <p><b>Правило не сохранено</b>{% if errors | length > 1 %} · причин {{ errors | length }}{% endif %}</p>
+  <ul>{% for line in errors %}<li>{{ line }}</li>{% endfor %}</ul>
+</div>
+{% endif %}
+{% if warnings %}
+<div class="warnbox">
+  <p><b>Сохранено, но не работает</b></p>
+  <ul>{% for line in warnings %}<li>{{ line }}</li>{% endfor %}</ul>
+</div>
+{% elif problem %}
+<div class="warnbox">
+  <p><b>Сохранено, но не работает</b></p>
+  <p>{{ problem }}</p>
+</div>
+{% endif %}
+
+<form method="post" action="{% if rule %}/panel/rules/{{ rule.id }}{% else %}/panel/rules/new{% endif %}">
+<input type="hidden" name="_csrf" value="{{ csrf }}">
+
+<label for="name">Название</label>
+<p class="hint">Для вас, а не для подписчиков. Его видно только в панели. До {{ limits.name }} символов.</p>
+<input type="text" id="name" name="name" value="{{ values.name }}">
+
+<label for="keywords">Ключевые слова</label>
+<p class="hint">
+  Слова, на которые правило срабатывает: по одному в строке или через запятую.
+  Регистр, эмодзи и знаки препинания не важны — «Гайд!!!» и «гайд» одно и то же.
+  До {{ limits.keywords }} слов.
+</p>
+<textarea id="keywords" name="keywords" rows="2">{{ values.keywords | join(', ') }}</textarea>
+
+<label for="match_mode">Как сравнивать</label>
+<p class="hint">
+  «Внутри текста» ловит и «хочу гайд», и «гайдик» — так морфология не съедает
+  срабатывания. «Точное совпадение» — только когда весь комментарий равен слову.
+  Короткие слова вроде «да» во «внутри текста» не кладите: они сработают внутри «давай».
+</p>
+<select id="match_mode" name="match_mode">
+  {% for mode in match_modes %}
+  <option value="{{ mode }}" {% if values.match_mode == mode %}selected{% endif %}>
+    {{ 'внутри текста' if mode == 'CONTAINS' else 'точное совпадение' }}
+  </option>
+  {% endfor %}
+</select>
+
+<label for="trigger">Где срабатывает</label>
+<select id="trigger" name="trigger">
+  {% for item in triggers %}
+  <option value="{{ item }}" {% if values.trigger == item %}selected{% endif %}>
+    {% if item == 'COMMENT' %}под комментариями{% elif item == 'DM' %}в личных сообщениях{% else %}везде{% endif %}
+  </option>
+  {% endfor %}
+</select>
+
+<label for="media_id">Пост</label>
+<p class="hint">
+  Пусто — правило работает под всеми постами. Укажите пост, и оно будет работать только
+  под ним; такое правило обходит общие.
+</p>
+<input type="text" id="media_id" name="media_id" value="{{ values.media_id or '' }}">
+
+<label for="priority">Приоритет</label>
+<p class="hint">Когда под одно слово подходят два правила, выигрывает то, у кого приоритет выше.</p>
+<input type="number" id="priority" name="priority" value="{{ values.priority }}">
+
+<label for="public_replies">Ответ под комментарием</label>
+<p class="hint">
+  Его видят все, кто читает ленту, — это лицо аккаунта. Вариантов можно несколько,
+  по одному в строке: сервис выберет случайный, чтобы под постом не стояло пятьдесят
+  одинаковых реплик. Пусто — публично не отвечаем. До {{ limits.variants }} вариантов.
+</p>
+<textarea id="public_replies" name="public_replies" rows="4">{{ values.public_replies | join('\n') }}</textarea>
+
+<label for="duplicate_replies">Ответ на повтор</label>
+<p class="hint">
+  Человек написал слово второй раз. Материал повторно не уйдёт — платформа не даёт, —
+  но молчание под постом видят посторонние, и это хуже отказа.
+</p>
+<textarea id="duplicate_replies" name="duplicate_replies" rows="3">{{ values.duplicate_replies | join('\n') }}</textarea>
+
+<label for="dm_text">Сообщение в директ</label>
+<p class="hint">
+  Уходит ровно одно сообщение. Дописать, поправить ссылку и прислать «а вот ещё» уже
+  нельзя: всё нужное должно быть здесь. Имени человека платформа не передаёт —
+  обращаться по имени не получится. Предел {{ limits.message_bytes }} байт;
+  кириллица весит два байта на букву, поэтому байты, а не символы.
+</p>
+<p class="hint">
+  Правила Meta требуют предупредить, что отвечает программа. Одной строкой в начале
+  и человеческими словами: «Это автоответ: сервис увидел кодовое слово в комментариях».
+</p>
+<textarea id="dm_text" name="dm_text" rows="7">{{ values.dm_text }}</textarea>
+
+<label>Кнопки</label>
+<p class="hint">
+  До {{ limits.buttons }} штук, заголовок до {{ limits.button_title }} символов,
+  ссылка только https:// и латиницей.
+</p>
+{% for button in buttons %}
+<div class="item">
+  <input type="text" name="button_title_{{ loop.index0 }}" value="{{ button.title or '' }}"
+         placeholder="Заголовок кнопки {{ loop.index }}">
+  <input type="text" name="button_url_{{ loop.index0 }}" value="{{ button.url or '' }}"
+         placeholder="https://…">
+</div>
+{% endfor %}
+
+<label for="enabled">
+  <input type="checkbox" id="enabled" name="enabled" {% if values.enabled %}checked{% endif %}>
+  Включено
+</label>
+
+<div class="buttons">
+  <button class="main" type="submit" name="action" value="save">Сохранить</button>
+  <button type="submit" name="action" value="save_on">Сохранить и включить</button>
+  <button type="submit" name="action" value="preview">Показать примеры</button>
+</div>
+</form>
+
+{% if preview %}
+<h2>Так это увидят разные люди</h2>
+<p class="hint">
+  {% raw %}{вариант1|вариант2}{% endraw %} — сервис выберет один из вариантов в момент
+  отправки. Пустой вариант тоже можно: {% raw %}Лови{те|}{% endraw %}. Вложенность
+  работает: {% raw %}{Привет{, дорогая|}|Хей}{% endraw %}. Чтобы написать фигурную скобку
+  буквально, поставьте перед ней обратный слэш.
+</p>
+{% if preview.broken %}
+<div class="bad">{{ preview.broken }}</div>
+{% else %}
+<h2>Сообщение в директ</h2>
+{% for sample in preview.dm %}
+<pre>{{ sample }}</pre>
+{% endfor %}
+<p class="hint">
+  {{ preview.worst_bytes }} из {{ preview.limit_bytes }} байт в самом длинном сочетании
+  вариантов — считаем по нему, а не по показанному, иначе правило однажды выпадет
+  отказом на неудачной комбинации.
+</p>
+{% endif %}
+{% if preview.public %}
+<h2>Ответ под комментарием</h2>
+{% for sample in preview.public %}<pre>{{ sample }}</pre>{% endfor %}
+{% endif %}
+{% if preview.duplicate %}
+<h2>Ответ на повтор</h2>
+{% for sample in preview.duplicate %}<pre>{{ sample }}</pre>{% endfor %}
+{% endif %}
+<p class="hint">Каждый раз сочетание новое — нажмите «Показать примеры» ещё раз, чтобы увидеть другие.</p>
+{% endif %}
+
+{% if rule %}
+<h2>Ещё</h2>
+<div class="buttons">
+  <form method="post" action="/panel/rules/{{ rule.id }}/copy">
+    <input type="hidden" name="_csrf" value="{{ csrf }}">
+    <button type="submit">Сделать копию</button>
+  </form>
+  <a href="/panel/rules/{{ rule.id }}/delete"><button class="risky" type="button">Удалить</button></a>
+  <a href="/panel/rules"><button type="button">К списку</button></a>
+</div>
+{% endif %}
+{% endblock %}

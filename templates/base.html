@@ -1,0 +1,89 @@
+{# Каркас панели. Ни одного внешнего файла: ни шрифтов, ни скриптов, ни CDN.
+   Панель открывают в момент аварии, иногда с телефона в чужой сети, — страница обязана
+   собраться из того, что уже пришло, и не рассказывать третьей стороне, что у этой
+   установки что-то сломалось. #}
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>{% block title %}Панель{% endblock %}</title>
+<style>
+:root { color-scheme: light dark; }
+* { box-sizing: border-box; }
+body { margin: 0; font: 16px/1.5 -apple-system, "Segoe UI", Roboto, sans-serif;
+       color: #1b1b1b; background: #f6f6f4; }
+a { color: #0b57d0; }
+main { max-width: 46rem; margin: 0 auto; padding: 1rem 1rem 4rem; }
+nav { display: flex; flex-wrap: wrap; gap: .25rem; padding: .6rem 1rem;
+      background: #fff; border-bottom: 1px solid #e3e3df; }
+nav a, nav button { padding: .35rem .7rem; border-radius: .5rem; text-decoration: none;
+      color: #444; font-size: .95rem; }
+nav a.on { background: #1b1b1b; color: #fff; }
+nav form { margin-left: auto; }
+h1 { font-size: 1.35rem; margin: 1.2rem 0 .4rem; }
+h2 { font-size: 1.05rem; margin: 1.6rem 0 .4rem; }
+p { margin: .5rem 0; }
+.card { background: #fff; border: 1px solid #e3e3df; border-left-width: 4px;
+        border-radius: .6rem; padding: .9rem 1rem; margin: 1rem 0; }
+.card.down { border-left-color: #c5221f; }
+.card.warn { border-left-color: #b06000; }
+.card.ok   { border-left-color: #1e8e3e; }
+.card h1 { margin-top: 0; }
+.note { background: #eef4ff; border: 1px solid #cfe0ff; border-radius: .6rem;
+        padding: .6rem .8rem; margin: 1rem 0; }
+.bad { background: #fdeceb; border: 1px solid #f5c6c4; border-radius: .6rem;
+       padding: .6rem .8rem; margin: 1rem 0; }
+.warnbox { background: #fdf3e3; border: 1px solid #f0dcb8; border-radius: .6rem;
+           padding: .6rem .8rem; margin: 1rem 0; }
+.rows { list-style: none; padding: 0; margin: 1rem 0; }
+.rows li { display: flex; gap: .5rem; padding: .35rem 0; border-bottom: 1px solid #ebebe7;
+           font-size: .92rem; }
+.rows b { min-width: 8.5rem; font-weight: 600; color: #555; }
+.rows .down { color: #c5221f; }
+.rows .warn { color: #b06000; }
+label { display: block; margin: .9rem 0 .2rem; font-weight: 600; font-size: .95rem; }
+.hint { color: #5a5a5a; font-size: .86rem; margin: .15rem 0 .3rem; }
+input[type=text], input[type=password], input[type=number], select, textarea {
+  width: 100%; padding: .5rem .6rem; border: 1px solid #c9c9c4; border-radius: .5rem;
+  font: inherit; background: #fff; }
+textarea { min-height: 5rem; resize: vertical; }
+button { font: inherit; padding: .5rem .9rem; border-radius: .5rem; border: 1px solid #c9c9c4;
+         background: #fff; cursor: pointer; }
+button.main { background: #1b1b1b; color: #fff; border-color: #1b1b1b; }
+button.risky { color: #c5221f; }
+.buttons { display: flex; flex-wrap: wrap; gap: .5rem; margin: 1.2rem 0; }
+.item { background: #fff; border: 1px solid #e3e3df; border-radius: .6rem;
+        padding: .8rem 1rem; margin: .7rem 0; }
+.meta { color: #5a5a5a; font-size: .86rem; }
+.off { color: #8a8a8a; }
+pre { white-space: pre-wrap; word-break: break-word; background: #f3f3f0;
+      border-radius: .5rem; padding: .5rem .7rem; margin: .3rem 0; font-size: .9rem; }
+footer { max-width: 46rem; margin: 0 auto; padding: 0 1rem 2rem; color: #7a7a7a;
+         font-size: .82rem; }
+</style>
+</head>
+<body>
+{% if active %}
+<nav>
+  <a href="/panel/" {% if active == 'state' %}class="on"{% endif %}>Состояние</a>
+  <a href="/panel/rules" {% if active == 'rules' %}class="on"{% endif %}>Правила</a>
+  <a href="/panel/queue" {% if active == 'queue' %}class="on"{% endif %}>Очередь</a>
+  <a href="/panel/token" {% if active == 'token' %}class="on"{% endif %}>Токен</a>
+  <form method="post" action="/panel/logout">
+    <input type="hidden" name="_csrf" value="{{ csrf }}">
+    <button type="submit">Выйти</button>
+  </form>
+</nav>
+{% endif %}
+<main>
+{% if note %}<div class="note">{{ note }}</div>{% endif %}
+{% block body %}{% endblock %}
+</main>
+<footer>
+  Публичные страницы этой установки: <a href="/privacy">политика конфиденциальности</a> ·
+  <a href="/data-deletion">удаление данных</a>
+</footer>
+</body>
+</html>

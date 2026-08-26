@@ -1,0 +1,28 @@
+{# Каркас публичных страниц. Самостоятельный, без панели: эти страницы обязаны
+   открываться, даже если панель из установки убрали. Ни одного внешнего файла —
+   страницу открывает проверяющий Meta, и она должна собираться целиком со своего
+   домена. #}
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}{% endblock %}</title>
+<style>
+body { margin: 0; font: 16px/1.6 -apple-system, "Segoe UI", Roboto, sans-serif;
+       color: #1b1b1b; background: #fff; }
+main { max-width: 42rem; margin: 0 auto; padding: 2rem 1rem 4rem; }
+h1 { font-size: 1.5rem; margin-bottom: .2rem; }
+h2 { font-size: 1.05rem; margin: 1.8rem 0 .4rem; }
+p, li { margin: .5rem 0; }
+ul { padding-left: 1.2rem; }
+.updated { color: #6a6a6a; font-size: .9rem; margin-top: 0; }
+a { color: #0b57d0; }
+</style>
+</head>
+<body>
+<main>
+{% block body %}{% endblock %}
+</main>
+</body>
+</html>

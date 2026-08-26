@@ -23,8 +23,10 @@ from starlette.requests import ClientDisconnect
 import admin
 import db
 import dispatcher
+import legal
 import logsafe
 import meta
+import panel
 import tokens
 from config import IG_APP_SECRET, IG_VERIFY_TOKEN
 from signature import verify_signature, verify_token
@@ -161,15 +163,33 @@ app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None
 # Приёма вебхуков он не касается: убрать эту строку и admin.py достаточно, чтобы сервис
 # вернулся к приёму вебхуков и доставке без всякого админ-API.
 app.include_router(admin.router)
+# Панель для человека: свои ворота (форма, пароль, подписанная cookie), свой префикс
+# /panel/*. Два роутера, а не один: на втором висит проверка сессии, и вход в неё
+# по устройству не попадает — путь-исключение внутри общей проверки однажды оказался бы
+# лишним открытым адресом. Убрать обе строки, panel.py и templates/ — сервис продолжит
+# принимать вебхуки и отвечать людям, просто настраивать его придётся через admin-API.
+app.include_router(panel.login_router)
+app.include_router(panel.router)
+# Публичные страницы: политику конфиденциальности требует сама Meta при публикации
+# приложения, а без публикации не приходят вебхуки. Отдаёт их сервис, чтобы адрес
+# не зависел от чужого хостинга и не протухал отдельно от установки.
+app.include_router(legal.router)
 
 
 async def retention_loop():
-    """Ретеншен: сырой журнал не растёт бесконечно."""
+    """Ретеншен: журнал уведомлений и карточки обращений не хранятся вечно.
+
+    Второе — не гигиена диска, а исполнение обещания: срок из публичной политики
+    конфиденциальности берётся из той же переменной, что и эта чистка
+    (config.DELIVERY_RETENTION_DAYS). Документ, который сервис не соблюдает, хуже
+    отсутствия документа.
+    """
     while True:
         try:
-            removed = await db.purge_old_events()
-            if removed:
-                log.info("ретеншен: удалено событий %s", removed)
+            events = await db.purge_old_events()
+            deliveries = await db.purge_old_deliveries()
+            if events or deliveries:
+                log.info("ретеншен: удалено уведомлений %s, обращений %s", events, deliveries)
         except Exception:
             log.exception("retention")
         await asyncio.sleep(RETENTION_SWEEP_SEC)

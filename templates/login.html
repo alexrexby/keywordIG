@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block title %}Вход в панель{% endblock %}
+{% block body %}
+<h1>Вход в панель</h1>
+<p class="hint">
+  Учётная запись здесь одна, и пароль вы задали при установке. Забыли — посчитайте хеш
+  заново и положите его в IG_ADMIN_PASSWORD_HASH: восстановить прежний нечем, он нигде
+  не хранится.
+</p>
+{% if error %}<div class="bad">{{ error }}</div>{% endif %}
+<form method="post" action="/panel/login">
+  <label for="password">Пароль</label>
+  <input type="password" id="password" name="password" autocomplete="current-password" autofocus>
+  <div class="buttons"><button class="main" type="submit">Войти</button></div>
+</form>
+{% endblock %}

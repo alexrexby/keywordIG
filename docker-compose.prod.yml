@@ -114,6 +114,25 @@ services:
       # Пустое значение админку не открывает, а закрывает целиком (fail-closed) —
       # поэтому и здесь не `:?`.
       IG_ADMIN_TOKEN: ${IG_ADMIN_TOKEN:-}
+      # Панель для человека. Пустой секрет или пустой хеш пароля панель ЗАКРЫВАЮТ,
+      # а не открывают, — поэтому и здесь не `:?`: сервис обязан продолжать принимать
+      # вебхуки и отвечать людям, даже если настраивать его временно негде.
+      IG_ADMIN_SECRET: ${IG_ADMIN_SECRET:-}
+      IG_ADMIN_PASSWORD_HASH: ${IG_ADMIN_PASSWORD_HASH:-}
+      # Срок хранения карточек обращений. Это же число печатает публичная политика
+      # конфиденциальности: у документа и у чистки один источник, иначе политика
+      # обещает то, чего сервис не делает. 0 — не удалять (страница напишет и это).
+      IG_DELIVERY_RETENTION_DAYS: ${IG_DELIVERY_RETENTION_DAYS:-365}
+      # Реквизиты для публичных страниц /privacy и /data-deletion. Без первых четырёх
+      # страницы отдают 503 с перечнем незаполненного: документ с дырами уедет в дашборд
+      # Meta и останется публичным лицом установки навсегда.
+      OWNER_SERVICE_NAME: ${OWNER_SERVICE_NAME:-}
+      OWNER_ACCOUNT: ${OWNER_ACCOUNT:-}
+      OWNER_LEGAL_NAME: ${OWNER_LEGAL_NAME:-}
+      OWNER_CONTACT_EMAIL: ${OWNER_CONTACT_EMAIL:-}
+      OWNER_TAX_ID: ${OWNER_TAX_ID:-}
+      OWNER_ADDRESS: ${OWNER_ADDRESS:-}
+      OWNER_POLICY_UPDATED: ${OWNER_POLICY_UPDATED:-}
     healthcheck:
       # /ig/health отдаёт 503, если круг диспетчера замер: безусловные 200 и были той
       # причиной, по которой немой сервис выглядел здоровым.

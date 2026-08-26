@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block title %}Уже нет{% endblock %}
+{% block body %}
+<div class="card warn">
+  <h1>Это {{ what }} уже удалено</h1>
+  <p>
+    Открытая страница относится к тому, чего в базе больше нет: скорее всего, удалили
+    в другой вкладке. Вернитесь к списку — там актуальное.
+  </p>
+</div>
+<div class="buttons">
+  <a href="/panel/rules"><button class="main" type="button">К списку правил</button></a>
+</div>
+{% endblock %}

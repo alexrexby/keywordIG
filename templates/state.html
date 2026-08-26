@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% block title %}Состояние{% endblock %}
+{% block body %}
+{# Один вердикт, а не шесть плашек: нижние причины часто оказываются следствием верхних,
+   и экран, где красное всё, не говорит, с чего начать. Остальное — строками ниже. #}
+<div class="card {{ verdict.level }}">
+  <h1>{{ verdict.title }}</h1>
+  {% for line in verdict.body %}
+  <p>{{ line }}</p>
+  {% endfor %}
+  {% if verdict.action %}
+  <div class="buttons">
+    {% if verdict.action.post %}
+    <form method="post" action="{{ verdict.action.href }}">
+      <input type="hidden" name="_csrf" value="{{ csrf }}">
+      <button class="main" type="submit">{{ verdict.action.label }}</button>
+    </form>
+    {% else %}
+    <a href="{{ verdict.action.href }}"><button class="main" type="button">{{ verdict.action.label }}</button></a>
+    {% endif %}
+  </div>
+  {% endif %}
+</div>
+
+<h2>Коротко</h2>
+<ul class="rows">
+  {% for row in summary %}
+  <li><b>{{ row.label }}</b><span class="{{ row.level }}">{{ row.text }}</span></li>
+  {% endfor %}
+</ul>
+<p class="meta">
+  Круг доставки: {{ last_tick }}.
+  Разобрано за сутки: {{ facts.account.handled_24h }}, из них не нашему аккаунту: {{ facts.account.foreign_24h }}.
+</p>
+{% endblock %}

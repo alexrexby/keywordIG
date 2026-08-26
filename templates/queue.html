@@ -1,0 +1,52 @@
+{% extends "base.html" %}
+{% block title %}Очередь{% endblock %}
+{% block body %}
+<h1>Очередь</h1>
+{% if not items %}
+<p>Ничего не ждёт отправки. Всё, что приходило, разобрано.</p>
+{% else %}
+<p class="hint">
+  Последние обращения: сверху свежие. Здесь видно, на чём спотыкается отправка —
+  и здесь же снимается бронь, если человеку материал так и не дошёл.
+</p>
+{% for item in items %}
+<div class="item">
+  <p>
+    <b>#{{ item.id }}</b> · {{ item.label }}
+    {% if item.username %}· @{{ item.username }} {% else %}· {{ item.igsid }} {% endif %}
+    {% if item.rule_name %}· правило «{{ item.rule_name }}»{% endif %}
+  </p>
+  {% if item.text %}<pre>{{ item.text }}</pre>{% endif %}
+  <p class="meta">
+    Пришло {{ item.when }} · попыток {{ item.attempts }}
+    {% if item.replied_public %}· ответили под постом{% endif %}
+    {% if item.dm_sent %}· материал ушёл{% endif %}
+    {% if item.state == 'PENDING' %}· следующая попытка не раньше {{ item.next_try }}{% endif %}
+  </p>
+  {% if item.last_error %}
+  <p class="meta">Последний отказ: {{ item.last_error }}</p>
+  {% endif %}
+  {% if item.holds_contact %}
+  <form method="post" action="/panel/queue/{{ item.id }}/release">
+    <input type="hidden" name="_csrf" value="{{ csrf }}">
+    <p class="hint">
+      На этом человеке висит бронь «материал уже выдавали»: повторный комментарий получит
+      публичное «уже отправляли». Если сообщение до него так и не дошло — снимите бронь,
+      и по следующему обращению материал уйдёт ему заново.
+    </p>
+    <button type="submit">Снять бронь</button>
+  </form>
+  {% endif %}
+</div>
+{% endfor %}
+{% endif %}
+<p class="meta">
+  {% if retention %}
+  Карточки обращений удаляются через {{ retention }} суток — этот же срок стоит
+  в публичной политике конфиденциальности.
+  {% else %}
+  Карточки обращений не удаляются: IG_DELIVERY_RETENTION_DAYS = 0. Тот же факт написан
+  и в публичной политике конфиденциальности.
+  {% endif %}
+</p>
+{% endblock %}
