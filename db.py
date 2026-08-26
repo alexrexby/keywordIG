@@ -523,6 +523,14 @@ async def admin_get_rule(rule_id: int) -> dict | None:
             return await cur.fetchone()
 
 
+async def admin_rule_names() -> list[str]:
+    """Только названия — их читает пометка копии (admin._copy_name). Тащить ради номера
+    в скобках все тексты правил незачем."""
+    async with pool_ref().connection() as conn:
+        cur = await conn.execute("SELECT name FROM instagram.ig_rule")
+        return [row[0] for row in await cur.fetchall()]
+
+
 async def admin_insert_rule(values: dict) -> dict:
     async with pool_ref().connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
@@ -554,6 +562,71 @@ async def admin_update_rule(rule_id: int, values: dict) -> dict | None:
                     "   dm_buttons = %s, create_lead_on = %s, updated_at = now()"
                     f" WHERE id = %s RETURNING {ADMIN_RULE_COLUMNS}",
                     _rule_params(values) + (rule_id,),
+                )
+            except WRITE_ERRORS as exc:
+                raise _rule_rejected(exc) from exc
+            return await cur.fetchone()
+
+
+async def admin_copy_rule(rule_id: int, name: str) -> dict | None:
+    """Копия правила ЦЕЛИКОМ, средствами базы. None — исходного правила уже нет.
+
+    Строка размножается через to_jsonb → jsonb_populate_record, а не собирается в питоне
+    из перечисленных колонок. Перечисление здесь — мина: колонка, добавленная миграцией
+    завтра, в копию бы не попала, ошибку никто бы не увидел (SQL остаётся валидным), а
+    вылезла бы она правилом, которое «скопировалось, но работает не так». Список колонок
+    берёт сама база из типа строки.
+
+    Подменяются ровно пять полей:
+      id                      — новая строка; nextval по той же последовательности, что
+                                стоит в DEFAULT (перечислив колонки явно, мы лишаемся
+                                DEFAULT'ов — их применить уже не к чему);
+      name                    — с пометкой копии, считает её админка;
+      enabled                 — копия всегда выключена (решение — в admin.copy_rule);
+      created_at, updated_at  — метки про ЭТУ строку, а не про исходную.
+    Резервации ig_contact_rule («этому человеку по этому правилу уже выдавали») не
+    копируются: бронь висит на паре человек+правило, у копии она своя и пустая.
+
+    Чего конструкция не переживёт — не гадательно, а по замеру ревью (четвёртый круг):
+      • колонка с UNIQUE (slug, внешний id) — копия ляжет с тем же значением, и вторая
+        строка не пройдёт: IntegrityError → RuleRejected → 400 с именем ограничения.
+        Ломается ГРОМКО, человек увидит отказ;
+      • колонка с персональным для правила значением, но БЕЗ уникальности (секрет
+        доставки, токен партнёра) — скопируется дословно, и два правила молча поделят
+        один секрет. Вот это тихо, и ради этого случая здесь предупреждение: заводишь
+        такую колонку — впиши её в jsonb_build_object ниже, рядом с id и name.
+    Проверенное вручную и НЕ опасное: обычная новая колонка переносится сама (замысел),
+    порядок колонок роли не играет (populate_record сопоставляет по имени), а тип без
+    обратного преобразования через jsonb не нашёлся ни на одном из 16 проверенных.
+    """
+    async with pool_ref().connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            try:
+                # Подзапрос не для красоты: `(f(x)).*` Postgres раскрывает в
+                # `(f(x)).col1, (f(x)).col2, …` и зовёт f по разу НА КАЖДУЮ колонку.
+                # Внутри стоит nextval — волатильный; замер ревью: 15 колонок = 15
+                # обращений к последовательности, id прыгали 1 → 2 → 17 → 32, и владелец
+                # читал в логах дыры как «кто-то удалил четырнадцать правил». Собранная
+                # в подзапросе запись вычисляется один раз (в PG16 он не разворачивается),
+                # и сдвиг ровно один. Инлайнить обратно нельзя: следующее волатильное
+                # значение здесь дало бы РАЗНЫЕ значения в разных колонках одной строки.
+                await cur.execute(
+                    "INSERT INTO instagram.ig_rule"
+                    " SELECT (rec).* FROM ("
+                    "   SELECT jsonb_populate_record("
+                    "            NULL::instagram.ig_rule,"
+                    "            to_jsonb(r) || jsonb_build_object("
+                    "              'id', nextval(pg_get_serial_sequence("
+                    "                              'instagram.ig_rule', 'id')),"
+                    "              'name', %s::text,"
+                    "              'enabled', false,"
+                    "              'created_at', now(),"
+                    "              'updated_at', now()"
+                    "            )) AS rec"
+                    "   FROM instagram.ig_rule r WHERE r.id = %s"
+                    " ) s"
+                    f" RETURNING {ADMIN_RULE_COLUMNS}",
+                    (name, rule_id),
                 )
             except WRITE_ERRORS as exc:
                 raise _rule_rejected(exc) from exc

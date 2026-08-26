@@ -19,6 +19,7 @@
 import asyncio
 import json
 import logging
+import re
 import time
 from datetime import datetime, timezone
 
@@ -65,6 +66,14 @@ MAX_KEYWORDS = 50
 MAX_NAME_LEN = 200
 MAX_REPLY_VARIANTS = 50
 
+# Пометка копии в названии и она же — то, что срезается перед новой пометкой. Иначе
+# копия копии копии называлась бы «X (копия) (копия) (копия)», а номер поколения читался
+# бы подсчётом скобок. Срезается ХВОСТ ЦЕЛИКОМ, а не одна пометка: название со стопкой
+# скобок могли набрать и руками, и тогда снятие одной вернуло бы имя, совпадающее
+# с исходным, — то самое, от чего пометка и заведена.
+COPY_MARK = "копия"
+COPY_TAIL = re.compile(rf"(?:\s*\({COPY_MARK}(?:\s+\d+)?\))+\s*$")
+
 _REQUIRED = object()
 # Ссылка на фоновый зонд токена (см. replace_token): asyncio держит слабую ссылку на
 # задачу, и без сильной её может собрать сборщик мусора прямо посреди запроса в Meta.
@@ -72,6 +81,10 @@ _probe_task: asyncio.Task | None = None
 # int4 в Postgres: значение вне диапазона — это SQLSTATE 22003 и 500 наружу, если не
 # поймать его здесь человеческим текстом.
 INT4_MIN, INT4_MAX = -2147483648, 2147483647
+# Место ещё не вставленной строки в порядке выбора: id ей выдаст bigserial, и он будет
+# больше всех существующих. Потолок bigint, а не «бесконечность», — сравнение идёт
+# с настоящими id из таблицы.
+INT8_LAST = 9223372036854775807
 
 # Поля правила: имя → (тип, значение по умолчанию при создании).
 # Порядок тот же, что в db.ADMIN_RULE_FIELDS; лишние поля в теле — отказ, а не тишина:
@@ -142,7 +155,9 @@ async def create_rule(request: Request):
     body = await _body(request)
     if isinstance(body, JSONResponse):
         return body
-    values, errors, warnings = _prepare(body, current=None)
+    # Соседей читаем, только если правило заводят сразу включённым: черновик никого
+    # перекрыть не может, а лишний запрос на каждое сохранение — плата ни за что.
+    values, errors, warnings = _prepare(body, current=None, siblings=await _siblings(body, None))
     if errors:
         return _rejected(errors)
     try:
@@ -150,6 +165,73 @@ async def create_rule(request: Request):
     except db.RuleRejected as exc:
         return _rejected([str(exc)])
     log.info("правило %s заведено: «%s», enabled=%s", row["id"], row["name"], row["enabled"])
+    return {"rule": _view(row), "warnings": warnings}
+
+
+# 201, а не 200 как у POST /rules: это контракт с формой, и он же честнее — в отличие
+# от создания, копия рождается без единого поля от клиента, и ссылаться дальше форме
+# не на что, кроме id из тела. Разнобой намеренный, выравнивать его не надо.
+@router.post("/rules/{rule_id}/copy", status_code=201)
+async def copy_rule(rule_id: int):
+    """Копия правила под соседний лид-магнит: тексты, кнопки и настройки совпадают,
+    заводить их заново по одному полю — работа ни о чём.
+
+    Три отличия копии от исходника, и каждое осознанное:
+      • ВЫКЛЮЧЕНА всегда, даже если исходное правило включено. Не потому, что «непонятно,
+        какое сработает» — как раз понятно: порядок в rules.match_rule детерминирован
+        (привязка к посту → priority DESC → id ASC), поэтому включённая копия с теми же
+        словами в той же области не срабатывает НИКОГДА — комментарий забирает исходное
+        правило, оно младше по id. Такая копия выглядит работающей и молчит, а это хуже
+        отказа. Копия рождается заготовкой; попытка включить её как есть даёт
+        предупреждение (_shadowed_by), но не отказ — слово или пост человек меняет сам;
+      • НАЗВАНИЕ с пометкой (см. _copy_name) — иначе в списке два одинаковых правила,
+        и включают не то;
+      • РЕЗЕРВАЦИИ не переносятся: «этому человеку уже выдавали» висит на паре
+        человек+правило (ig_contact_rule), у копии пара своя и список пуст. Значит, по
+        копии те же люди получат материал ещё раз — это цена того, что копия является
+        отдельным правилом; повторная выдача по ОДНОМУ правилу по-прежнему невозможна.
+
+    Само копирование делает база (db.admin_copy_rule) — там же, почему не в питоне.
+    Проверки те же и теми же функциями, что при создании руками, но их находки здесь не
+    отказ, а ПРЕДУПРЕЖДЕНИЯ — см. ниже по коду.
+    """
+    current = await db.admin_get_rule(rule_id)
+    if current is None:
+        return _not_found(rule_id)
+    # Из снимка берётся ТОЛЬКО название: его надо придумать до вставки, и оно всё равно
+    # своё. Содержимое копии из снимка не берётся вовсе — строку читает сам INSERT.
+    taken = await db.admin_rule_names()
+    try:
+        row = await db.admin_copy_rule(rule_id, _copy_name(current["name"], taken))
+    except db.RuleRejected as exc:
+        return _rejected([str(exc)])
+    if row is None:
+        # Правило удалили между чтением и вставкой. Копировать стало нечего.
+        return _not_found(rule_id)
+
+    # Разбираем СОЗДАННУЮ строку, а не снимок. Между двумя чтениями исходник мог
+    # измениться — руками по рецепту из 003_seed_rule.sql («UPDATE … WHERE name = …»)
+    # или вторым админом, — и тогда список «что починить» описывал бы содержимое,
+    # которого в копии нет. Блокировок для этого не нужно: то, что легло в таблицу,
+    # уже лежит и никуда не денется.
+    #
+    # Находки проверок здесь не отказ, а список того, что в копии починить. Причина не в
+    # снисходительности: строка УЖЕ лежит в таблице, копия ничего нового в базу не
+    # приносит и, будучи выключенной, диспетчером не читается вовсе (load_rules берёт
+    # только enabled). А 400 запирал бы человека ровно там, где копия нужнее всего:
+    # засеянное правило 003_seed_rule.sql валидацию СОЗДАНИЯ не проходит — плейсхолдер
+    # ссылки «https://ЗАМЕНИ-НА-…» кириллический, и это ошибка, а не предупреждение.
+    # Включить копию, не починив, по-прежнему нельзя: PATCH прогоняет то же самое,
+    # и там это снова ошибки.
+    values, problems, _ = _prepare({}, current=row)
+    warnings = list(problems)
+    # Предупреждение _prepare берём не у него: найдя ошибки, до unconfigured он не
+    # доходит — а для копии это главная новость (незаполненный плейсхолдер), и терять
+    # её из-за соседней жалобы нельзя.
+    reason = rules.unconfigured(_probe(values))
+    if reason:
+        warnings.append(f"копию нельзя будет включить — {reason}")
+    log.info("правило %s скопировано в %s: «%s»", rule_id, row["id"], row["name"])
     return {"rule": _view(row), "warnings": warnings}
 
 
@@ -161,7 +243,9 @@ async def update_rule(rule_id: int, request: Request):
     current = await db.admin_get_rule(rule_id)
     if current is None:
         return _not_found(rule_id)
-    values, errors, warnings = _prepare(body, current=current)
+    values, errors, warnings = _prepare(
+        body, current=current, siblings=await _siblings(body, current), rule_id=rule_id
+    )
     if errors:
         return _rejected(errors)
     try:
@@ -372,15 +456,62 @@ def _moment(value: datetime | None) -> str | None:
     return value.isoformat() if value else None
 
 
+def _copy_name(source: str, taken: list[str]) -> str:
+    """«X» → «X (копия)», «X (копия)» → «X (копия 2)». Номер — первый свободный.
+
+    Свободный именно среди ЗАВЕДЁННЫХ названий, а не следующий по счёту от исходного:
+    копировать одно базовое правило под три лид-магнита — обычное дело, а три строки
+    «X (копия)» в списке различить нечем. Уникальности названий схема не требует, и
+    гонку двух одновременных копий это не закрывает — только избавляет от совпадений
+    в тот единственный момент, когда человек смотрит на список.
+    """
+    base = COPY_TAIL.sub("", source).strip()
+    # Исходное название — тоже занятое, даже если вызвавший забыл его передать: копия,
+    # названная в точности как оригинал, — это ровно тот случай, который пометка чинит.
+    known = set(taken) | {source}
+    number = 1
+    while True:
+        mark = f"({COPY_MARK})" if number == 1 else f"({COPY_MARK} {number})"
+        # Потолок названия тот же, что при создании руками (MAX_NAME_LEN). Режем ОСНОВУ,
+        # а не пометку: пометка и есть то, ради чего название меняли.
+        head = base[: MAX_NAME_LEN - len(mark) - 1].rstrip()
+        candidate = f"{head} {mark}" if head else mark
+        if candidate not in known:
+            return candidate
+        number += 1
+
+
 # ---------- Валидация ----------
 
 
-def _prepare(body: dict, current: dict | None) -> tuple[dict, list[str], list[str]]:
+async def _siblings(body: dict, current: dict | None) -> list[dict] | None:
+    """Остальные правила — для проверки перекрытия слов. None, когда проверять нечего.
+
+    Чтение стоит одного запроса, поэтому идёт только на включённом правиле: сохранение
+    черновика (а это большинство сохранений) остаётся ровно таким же, каким было.
+    Заодно None здесь — это и есть выключатель проверки для copy_rule: копия рождается
+    выключенной, соседей ей читать незачем.
+    """
+    enabled = body.get("enabled", current["enabled"] if current else False)
+    return await db.admin_list_rules() if enabled is True else None
+
+
+def _prepare(
+    body: dict,
+    current: dict | None,
+    siblings: list[dict] | None = None,
+    rule_id: int | None = None,
+) -> tuple[dict, list[str], list[str]]:
     """Тело запроса + текущее правило → (значения для записи, ошибки, предупреждения).
 
     Ошибка — отказ сохранять. Предупреждение — правило сохранится, но работать не будет:
     так сохраняется черновик с незаполненным плейсхолдером (ровно так заведено правило
     из 003_seed_rule.sql). Включить такое правило нельзя — это уже ошибка.
+
+    siblings — остальные правила таблицы; нужны ровно для проверки перекрытия слов
+    (_shadowed_by) и потому читаются вызывающим только тогда, когда правило включают.
+    rule_id — id правила, которое сейчас правят (None при создании): порядок выбора
+    зависит от id, а у ещё не вставленной строки его нет.
     """
     errors: list[str] = []
     unknown = sorted(set(body) - set(FIELDS))
@@ -423,7 +554,73 @@ def _prepare(body: dict, current: dict | None) -> tuple[dict, list[str], list[st
             errors.append(f"правило нельзя включить — {reason}")
         else:
             warnings.append(f"правило сохранено выключенным: {reason}")
+
+    # Правило включают, а слова у него целиком забирает другое включённое — предупреждаем,
+    # но не отказываем: перекрытие бывает и осознанным (правило про запас, замена
+    # старому), а запрет заставил бы человека выключать соседа ради сохранения.
+    # Отказывать нельзя ещё и потому, что это единственная проверка, которая смотрит
+    # на СОСЕДЕЙ, а не на само правило: соседи меняются без нас.
+    if values["enabled"] and siblings:
+        eclipsed = _shadowed_by(values, rule_id, siblings)
+        if eclipsed:
+            warnings.append(
+                f"правило включено, но сработать не сможет: все его слова забирает"
+                f" правило «{eclipsed['name']}» (id {eclipsed['id']}) — оно идёт раньше"
+                " по тому же порядку, что у диспетчера (привязка к посту → приоритет →"
+                " id). Поменяйте слово, поднимите приоритет или привяжите это правило"
+                " к своему посту"
+            )
     return values, errors, warnings
+
+
+def _shadowed_by(values: dict, rule_id: int | None, siblings: list[dict]) -> dict | None:
+    """Включённое правило, которое заберёт себе ВСЕ срабатывания этого. None — нет такого.
+
+    Ровно тот порядок, по которому выбирает диспетчер (rules.match_rule): привязанные
+    к посту → priority DESC → id ASC. Условия намеренно строгие — предупреждение должно
+    быть правдой, а не подозрением:
+      • одна и та же область (media_id совпадает). Более узкий сосед (он с постом, мы без)
+        отбирает срабатывания только на своём посту, на остальных мы работаем;
+      • сосед ловит все наши поводы (trigger): COMMENT+DM у нас против только COMMENT
+        у него — не перекрытие;
+      • сосед идёт раньше нас в этом порядке. У новой строки id ещё нет, и она заведомо
+        последняя — поэтому None здесь означает «самый большой id», а не «нулевой»;
+      • КАЖДОЕ наше слово ловится соседом. Подстрочность CONTAINS учтена: сосед со словом
+        «гайд» перекрывает наше «гайдной», но не наоборот. EXACT перекрывает только
+        такое же EXACT-слово: наш CONTAINS ловит и «хочу гайд», а его EXACT — нет.
+    """
+    words = [w for w in (rules.normalize(k) for k in values["keywords"]) if w]
+    if not words:
+        return None
+    mine = (-values["priority"], rule_id if rule_id is not None else INT8_LAST)
+    for other in siblings:
+        if not other["enabled"] or other["id"] == rule_id:
+            continue
+        if other["media_id"] != values["media_id"]:
+            continue
+        if not _triggers(values["trigger"]) <= _triggers(other["trigger"]):
+            continue
+        if (-other["priority"], other["id"]) >= mine:
+            continue
+        theirs = [w for w in (rules.normalize(k) for k in other["keywords"]) if w]
+        if all(_caught(word, values["match_mode"], theirs, other["match_mode"])
+               for word in words):
+            return other
+    return None
+
+
+def _triggers(value: str) -> set[str]:
+    return {"COMMENT", "DM"} if value == "BOTH" else {value}
+
+
+def _caught(word: str, mode: str, theirs: list[str], their_mode: str) -> bool:
+    """Ловит ли сосед всё, что ловит наше слово. Тексты сравниваются нормализованными."""
+    if their_mode == "CONTAINS":
+        # Любой текст с нашим словом содержит и их подстроку — значит, ловит.
+        return any(w in word for w in theirs)
+    # Сосед EXACT: он срабатывает только на текст, равный слову целиком. Перекрыть нас
+    # он может, лишь если и мы EXACT ровно с тем же словом.
+    return mode == "EXACT" and word in theirs
 
 
 def _coerce(name: str, kind: str, raw):
